@@ -14,6 +14,7 @@ fn legacy_collect_typo_edges(
     autocorrect_types: u32,
 ) -> Vec<TypoEdge> {
     let mut planned = plan_keys(profile, segments, literal_best, autocorrect_types);
+    plan_tail_keys(profile, segments, autocorrect_types, &mut planned);
     plan_edit_keys(
         segments,
         literal_best,
@@ -64,6 +65,7 @@ fn plan_all(
     autocorrect_types: u32,
 ) -> Vec<PlannedKey> {
     let mut planned = plan_keys(profile, segments, literal_best, autocorrect_types);
+    plan_tail_keys(profile, segments, autocorrect_types, &mut planned);
     plan_edit_keys(
         segments,
         literal_best,

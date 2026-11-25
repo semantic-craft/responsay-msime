@@ -276,7 +276,7 @@ impl InputSession {
             return KeyResult::unhandled();
         };
         if edit.pins.is_empty() {
-            return self.commit(edit.origin_index);
+            return self.commit(edit.origin_index, super::commit::CommitOrigin::Default);
         }
         let text = edit.text();
         let mut item = edit.origin;
@@ -295,7 +295,12 @@ impl InputSession {
         // 改字后仍要按原候选的纠错来源消费全部原始按键。
         let diagnostic = self.learn_conversion_sentence(&item);
         self.caret = None;
-        self.commit_selection(Some(item), Some(text), diagnostic)
+        self.commit_selection(
+            Some(item),
+            Some(text),
+            diagnostic,
+            super::commit::CommitOrigin::PinnedConversion,
+        )
     }
 
     /// 把改好的整句存成个人词条，规则与选中整句候选（`learn_sentence_candidate`）相同。

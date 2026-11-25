@@ -602,6 +602,16 @@ impl NineKeySession {
         self.mixed_candidates_enabled = enabled;
     }
 
+    pub fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        if self.english_options.mixed_candidates == enabled {
+            return;
+        }
+        self.english_options.mixed_candidates = enabled;
+        if self.active() {
+            self.refresh();
+        }
+    }
+
     /// 数字正好拼出 `riqi`、`sj` 这类关键词时，把当前日期、时间、星期或农历接在对应的词后面，见 `local::date_time::insert_inline_date_time`；`None` 关掉。与 emoji 选项一样只在建会话时设置，测试换时钟时再设一次。
     pub fn set_inline_date_time(&mut self, clock: Option<LocalClock>) {
         self.inline_date_time = clock;

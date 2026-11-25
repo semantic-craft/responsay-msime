@@ -15601,6 +15601,204 @@ INSERT INTO quick_parases VALUES('qq','腾讯',20);"
     assert!(words(&session).contains(&"腾讯".to_owned()));
 }
 
+#[test]
+fn committed_pinyin_spans_validate_exact_full_pinyin_with_learning_disabled() {
+    crate::warm_quanpin_autocorrect();
+
+    let fixture = Fixture::new(
+        "CREATE TABLE tbl_1_n(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_n VALUES('nve','n','虐',500),('ni','n','你',500);
+         CREATE TABLE tbl_1_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_j VALUES('ju','j','居',500);
+         CREATE TABLE tbl_1_z(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_z VALUES('zhang','z','张',500);
+         CREATE TABLE tbl_1_s(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_s VALUES('shang','s','上',800),('sha','s','沙',100);
+         CREATE TABLE tbl_2_n(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_n VALUES('ni''hao','nh','你好',1000);
+         CREATE TABLE tbl_2_s(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_s VALUES('shi''jie','sj','世界',1000),('shang''hai','sh','上海',1000);
+         CREATE TABLE tbl_2_x(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_x VALUES('xi''an','xa','西安',1000);
+         CREATE TABLE tbl_2_p(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_p VALUES('ping''guo','pg','苹果',1000);
+         CREATE TABLE tbl_4_p(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_4_p VALUES('ping''guo''dian''nao','pgdn','苹果电脑',900);
+         CREATE TABLE tbl_2_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_c VALUES('cheng''xu','cx','程序',800);
+         CREATE TABLE tbl_1_y(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_y VALUES('yan','y','严',200);
+         CREATE TABLE tbl_3_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_3_c VALUES('cheng''xu''yuan','cxy','程序员',900);",
+    )
+    .with_english("INSERT INTO english_words VALUES('apple','apple',500);");
+
+    let mut options = SessionOptions::new(fixture.paths().clone());
+    options.learning = false;
+    options.personal_context = false;
+    options.learn_english_on_enter = false;
+    options.autocorrect_types = crate::types::autocorrect_type::TRANSPOSITION
+        | crate::types::autocorrect_type::NEIGHBOR
+        | crate::types::autocorrect_type::MISSING_OR_EXTRA;
+    options.fuzzy_pinyin.rules = crate::types::fuzzy_rule::S_SH;
+    options.english.mixed_candidates = true;
+    options.english.minimum_prefix = 4;
+    let mut session = Session::new(options).unwrap();
+
+    let select_word = |session: &mut Session, target: &str| {
+        let index = words(session)
+            .iter()
+            .position(|word| word == target)
+            .unwrap_or_else(|| panic!("{target} missing in {:?}", words(session)));
+        session.select(index)
+    };
+
+    // 1. Multi-step partial pick ("你好") followed by punctuation flush ("世界，").
+    type_text(&mut session, "nihaoshijie");
+    let first = select_word(&mut session, "你好");
+    assert_eq!(first.commit.as_deref(), Some("你好"));
+    assert_eq!(
+        session.last_committed_pinyin_spans(),
+        &[crate::CommittedPinyinSpan {
+            raw_consumed_bytes: 5,
+            raw_advance_bytes: 5,
+            is_exact_uncorrected_full_pinyin: true,
+            explicit_pick: true,
+            resets_composition: false,
+        }]
+    );
+    let second = session.punctuation(b',');
+    assert_eq!(second.commit.as_deref(), Some("世界，"));
+    assert_eq!(
+        session.last_committed_pinyin_spans(),
+        &[crate::CommittedPinyinSpan {
+            raw_consumed_bytes: 6,
+            raw_advance_bytes: 6,
+            is_exact_uncorrected_full_pinyin: true,
+            explicit_pick: false,
+            resets_composition: true,
+        }]
+    );
+
+    // 2. Manual delimiter ("xi'an") and umlaut aliases ("nue" -> "nve", "jv" -> "ju") are exact.
+    type_text(&mut session, "xi'an");
+    assert_eq!(
+        session.command(Command::CommitCandidate).commit.as_deref(),
+        Some("西安")
+    );
+    assert_eq!(
+        session.last_committed_pinyin_spans(),
+        &[crate::CommittedPinyinSpan {
+            raw_consumed_bytes: 5,
+            raw_advance_bytes: 5,
+            is_exact_uncorrected_full_pinyin: true,
+            explicit_pick: false,
+            resets_composition: true,
+        }]
+    );
+
+    type_text(&mut session, "nue");
+    select_word(&mut session, "虐");
+    assert!(session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+    assert_eq!(
+        session.last_committed_pinyin_spans()[0].raw_consumed_bytes,
+        3
+    );
+
+    type_text(&mut session, "jv");
+    select_word(&mut session, "居");
+    assert!(session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+    assert_eq!(
+        session.last_committed_pinyin_spans()[0].raw_consumed_bytes,
+        2
+    );
+
+    // 3. Jianpin, longer-phrase completion, AC=15 typos, fuzzy Pinyin, mixed English, literal, and non-end caret all reject exactness.
+    type_text(&mut session, "nh");
+    select_word(&mut session, "你好");
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+
+    type_text(&mut session, "pingguo");
+    select_word(&mut session, "苹果电脑");
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+
+    for (typo, target) in [
+        ("zhng", "张"),
+        ("shanhg", "上"),
+        ("sahng", "上"),
+        ("nihwo", "你好"),
+        ("chengxuyan", "程序员"),
+        ("sanghai", "上海"),
+    ] {
+        type_text(&mut session, typo);
+        select_word(&mut session, target);
+        assert!(
+            !session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin,
+            "{typo} -> {target} unexpectedly marked exact"
+        );
+    }
+
+    type_text(&mut session, "shangg");
+    select_word(&mut session, "上");
+    assert_eq!(
+        session.last_committed_pinyin_spans(),
+        &[crate::CommittedPinyinSpan {
+            raw_consumed_bytes: 5,
+            raw_advance_bytes: 5,
+            is_exact_uncorrected_full_pinyin: true,
+            explicit_pick: true,
+            resets_composition: false,
+        }]
+    );
+    session.command(Command::Cancel);
+
+    type_text(&mut session, "apple");
+    select_word(&mut session, "apple");
+    assert_eq!(
+        session.last_committed_pinyin_spans(),
+        &[crate::CommittedPinyinSpan {
+            raw_consumed_bytes: 0,
+            raw_advance_bytes: 5,
+            is_exact_uncorrected_full_pinyin: false,
+            explicit_pick: true,
+            resets_composition: true,
+        }]
+    );
+
+    type_text(&mut session, "niHao");
+    session.command(Command::CommitCandidate);
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+    session.command(Command::Cancel);
+
+    type_text(&mut session, "nihao");
+    session.set_caret(Some(2));
+    select_word(&mut session, "你");
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+    session.command(Command::Cancel);
+    assert!(session.last_committed_pinyin_spans().is_empty());
+
+    // 4. Live `set_autocorrect_types` and `set_english_mixed_candidates` refresh active compositions without reopening `Session`.
+    let ac_all = crate::types::autocorrect_type::TRANSPOSITION
+        | crate::types::autocorrect_type::NEIGHBOR
+        | crate::types::autocorrect_type::MISSING_OR_EXTRA;
+    session.set_autocorrect_types(0);
+    type_text(&mut session, "chengxuyan");
+    assert!(!words(&session).iter().any(|w| w == "程序员"));
+    session.set_autocorrect_types(ac_all);
+    assert!(words(&session).iter().any(|w| w == "程序员"));
+    session.command(Command::Cancel);
+
+    type_text(&mut session, "apple");
+    assert!(words(&session).iter().any(|w| w == "apple"));
+    session.set_english_mixed_candidates(false);
+    assert!(!words(&session).iter().any(|w| w == "apple"));
+    session.set_english_mixed_candidates(true);
+    assert!(words(&session).iter().any(|w| w == "apple"));
+    session.command(Command::Cancel);
+
+    assert!(!fixture.paths().user(crate::assets::USER_JOURNAL).exists());
+}
+
 mod caret_suffix;
 mod grid_exact;
 mod grid_helpcode;

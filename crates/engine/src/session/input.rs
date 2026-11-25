@@ -11,7 +11,7 @@ use super::chain::CommitChain;
 use super::clock::Clock;
 use super::conversion::ConversionEdit;
 use super::online::OnlineRequestGuard;
-use super::options::SessionOptions;
+use super::options::{CommittedSpanList, SessionOptions};
 use crate::assets;
 use crate::cantonese;
 use crate::diagnostics;
@@ -157,6 +157,8 @@ pub(super) struct InputSession {
     pub date_time_menu_page: Option<Vec<WordItem>>,
     /// 触屏宿主为下一次 `character` 送来的按下点（`Session::set_key_touch`），只在 `dispatch_character` 把这一键交给方案之前用掉；其余路径一律丢掉。
     pub pending_touch: Option<KeyTouch>,
+    /// 本次操作期间已上屏各段的原文消耗范围与全拼精确性标记，纯内存暂存，不写磁盘。
+    pub committed_spans: CommittedSpanList,
 }
 
 impl InputSession {
@@ -279,6 +281,7 @@ impl InputSession {
             canonical_phrase_engine: None,
             conversion: None,
             pending_touch: None,
+            committed_spans: CommittedSpanList::default(),
             journal_path: journal,
             paths,
         };
@@ -1111,7 +1114,7 @@ impl InputSession {
                 KeyResult::handled()
             }
             Command::Backspace => self.backspace(),
-            Command::CommitCandidate => self.commit(0),
+            Command::CommitCandidate => self.commit(0, super::commit::CommitOrigin::Default),
             // `CommitRawWithoutLearning` 到不了组字（`Session::command` 已经换掉），与 `CommitRaw` 同列只为穷尽。
             Command::CommitRaw | Command::CommitRawWithoutLearning => self.commit_raw(),
             Command::CommitReading => {
@@ -1170,7 +1173,9 @@ impl InputSession {
             Command::Cancel | Command::Backspace if self.close_korean_hanja() => {
                 Some(KeyResult::handled())
             }
-            Command::CommitCandidate if self.engine.korean_hanja_open() => Some(self.commit(0)),
+            Command::CommitCandidate if self.engine.korean_hanja_open() => {
+                Some(self.commit(0, super::commit::CommitOrigin::Default))
+            }
             _ => None,
         }
     }
@@ -2100,13 +2105,27 @@ impl InputSession {
         self.update_mixed_candidates();
     }
 
-    fn set_autocorrect_types(&mut self, types: u32) {
+    pub(super) fn set_autocorrect_types(&mut self, types: u32) {
         // Hosts may re-apply their configuration before every key; an unchanged value must not rebuild the list on that hot path.
         if self.autocorrect_types == types {
             return;
         }
         self.autocorrect_types = types;
         self.engine.set_autocorrect_types(types);
+        if self.has_composition() {
+            self.prefix_query_input.clear();
+            self.recompute_candidates();
+            self.invalidate_online_requests();
+        } else {
+            self.update_mixed_candidates();
+        }
+    }
+
+    pub(super) fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        if self.english_options.mixed_candidates == enabled {
+            return;
+        }
+        self.english_options.mixed_candidates = enabled;
         self.update_mixed_candidates();
     }
 

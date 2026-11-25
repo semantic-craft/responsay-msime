@@ -18,6 +18,8 @@ pub const TYPO_KEY_BUDGET: usize = 96;
 /// A variant is only looked up as part of a phrase. Replacing a lone character almost never beats the literal reading, and those lookups were the costly half: a syllable's table holds hundreds of rows per key, all read to find the top few. Dropping them halved the lookup time and cost 0.1 point of recall on the typo eval set (QD:37-41).
 pub const MIN_TYPO_SPAN_SYLLABLES: usize = 2;
 pub const MAX_TYPO_SPAN_SYLLABLES: usize = 3;
+const MAX_TAIL_TYPO_SPAN_SYLLABLES: usize = 4;
+const TAIL_TYPO_KEY_BUDGET: usize = 48;
 pub const TYPO_ROWS_PER_KEY: usize = 4;
 
 struct PlannedKey {
@@ -74,6 +76,7 @@ pub fn collect_typo_edges(
     autocorrect_types: u32,
 ) -> Vec<TypoEdge> {
     let mut planned = plan_keys(profile, segments, literal_best, autocorrect_types);
+    plan_tail_keys(profile, segments, autocorrect_types, &mut planned);
     plan_edit_keys(
         segments,
         literal_best,
@@ -198,6 +201,10 @@ fn multi_letter_syllable_trie() -> &'static [SyllableTrieNode] {
         }
         nodes.into_boxed_slice()
     })
+}
+
+pub(crate) fn warm_syllable_trie() {
+    let _ = multi_letter_syllable_trie();
 }
 
 /// 窗口的改法只取决于窗口里的字面音节和纠错开关，与上下文无关，所以按它们缓存：键是开关加音节（`15:zi'a`），空结果也存。连续打字时前面的窗口不变，每一键只有末尾几个新窗口要算；不缓存时每一键都把整串的窗口重算一遍，长句里这一步占了按键的大半时间。
@@ -366,7 +373,7 @@ fn plan_edit_keys(
                     });
                 }
                 added += 1;
-                if added >= EDIT_KEY_BUDGET {
+                if added >= EDIT_KEY_BUDGET || planned.len() >= TYPO_KEY_BUDGET + EDIT_KEY_BUDGET {
                     return;
                 }
             }
@@ -587,6 +594,69 @@ fn lookup_planned_edges(
         }));
     }
     edges
+}
+
+/// Long fluent prefixes can exhaust `TYPO_KEY_BUDGET` on early two-syllable tiles before reaching a trailing typo (`wo'men'dou'zai'xue'xi'ren'gong'zhi'nen`), and four-syllable compounds (`人工智能`) span four columns. Reserve a small tail budget on the last two syllables so trailing phrase/compound corrections remain reachable regardless of sentence length.
+fn plan_tail_keys(
+    profile: &PersonalTypoProfile,
+    segments: &[String],
+    autocorrect_types: u32,
+    planned: &mut Vec<PlannedKey>,
+) {
+    let n = segments.len();
+    if autocorrect_types == 0 || n < MIN_TYPO_SPAN_SYLLABLES {
+        return;
+    }
+    let max_len = MAX_TAIL_TYPO_SPAN_SYLLABLES.min(n);
+    let mut added = 0usize;
+    let mut variants = Vec::new();
+    for position in (n.saturating_sub(2)..n).rev() {
+        let typed = &segments[position];
+        let typos = syllable_typos(typed);
+        if typos.is_empty() {
+            continue;
+        }
+        variants.clear();
+        variants.extend(
+            typos
+                .iter()
+                .filter(|typo| autocorrect_types & autocorrect_bit(typo.kind) != 0)
+                .map(|typo| (typo, profile.accepted(typed, &typo.syllable))),
+        );
+        if variants.is_empty() {
+            continue;
+        }
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.1));
+        for &(typo, accepted) in &variants {
+            let penalty = discounted(base_cost(typo.kind), accepted);
+            for length in MIN_TYPO_SPAN_SYLLABLES..=max_len {
+                let first = (position + 1).saturating_sub(length);
+                for start in first..=position {
+                    let end = start + length;
+                    if end > n {
+                        break;
+                    }
+                    let key = typo_span_key(segments, start, end, position - start, &typo.syllable);
+                    if planned
+                        .iter()
+                        .any(|entry| entry.start == start && entry.end == end && entry.key == key)
+                    {
+                        continue;
+                    }
+                    planned.push(PlannedKey {
+                        start,
+                        end,
+                        key,
+                        penalty,
+                    });
+                    added += 1;
+                    if added >= TAIL_TYPO_KEY_BUDGET {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 按弱位置优先规划并去重纠错跨度键，最多保留 `TYPO_KEY_BUDGET` 项。

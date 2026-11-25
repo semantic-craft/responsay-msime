@@ -1,19 +1,43 @@
 //! Selection and commit (core-session.md §5.7).
 
+use std::borrow::Cow;
+
 use super::cantonese_learning::{is_cantonese_row, CantonesePick};
 use super::chain::Pick;
+use super::composition::canonical_pinyin_is_valid_for_word;
 use super::input::InputSession;
+use super::options::CommittedPinyinSpan;
 use crate::diagnostics;
 use crate::error::Result;
+use crate::pinyin::active_helpcode::strip_active_helpcodes_with_cases;
 use crate::pinyin::segment::{join_segments, split_segments};
-use crate::pinyin::syllables::normalize_umlaut_aliases;
+use crate::pinyin::syllables::{intact_piece, normalize_umlaut_aliases, MAX_SYLLABLE_LENGTH};
 use crate::quanpin::QuanpinEngine;
+use crate::shuangpin::query::raw_length_for_effective_prefix;
 use crate::text::count_utf8_chars;
 use crate::types::{
     CandidateEdge, CandidateSource, KeyResult, LocalInputMode, PersonalDictionaryKind, SchemeType,
     WordItem,
 };
 use crate::user_dictionary::journal::is_user_inserted;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommitOrigin {
+    Default,
+    ExplicitPick,
+    PinnedConversion,
+    CaretEdit,
+}
+
+impl CommitOrigin {
+    fn is_explicit_pick(self) -> bool {
+        matches!(self, Self::ExplicitPick)
+    }
+}
+
+fn saturating_span_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
 
 /// 提交只会读取这些候选字段；纠错来源用于计算原始按键的消费长度。
 pub(super) fn clone_selected_candidate(item: &WordItem, copy_sentence_words: bool) -> WordItem {
@@ -23,6 +47,7 @@ pub(super) fn clone_selected_candidate(item: &WordItem, copy_sentence_words: boo
         word: item.word.clone(),
         source: item.source,
         scheme: item.scheme,
+        fuzzy: item.fuzzy,
         corrected_from: item.corrected_from.clone(),
         sentence_words: if copy_sentence_words && item.source.is_generated_or_fallback() {
             item.sentence_words.clone()
@@ -56,7 +81,7 @@ impl InputSession {
             self.enter_url_mode(text);
             return KeyResult::handled();
         }
-        self.commit(index)
+        self.commit(index, CommitOrigin::ExplicitPick)
     }
 
     pub(super) fn select_candidate_edge(&mut self, index: usize, edge: CandidateEdge) -> KeyResult {
@@ -158,7 +183,7 @@ impl InputSession {
             return result;
         }
         while self.has_composition() {
-            let part = self.commit(index);
+            let part = self.commit(index, CommitOrigin::Default);
             index = 0;
             result.handled = true;
             if let Some(text) = part.commit {
@@ -177,11 +202,19 @@ impl InputSession {
     }
 
     /// 选中第 `index` 条并上屏或推进组字。光标后编辑生效时先交给它（`commit_caret_edit`）。
-    pub(super) fn commit(&mut self, index: usize) -> KeyResult {
+    pub(super) fn commit(&mut self, index: usize, origin: CommitOrigin) -> KeyResult {
         if let Some((_, rows)) = &self.glide_candidates {
+            let raw_len = saturating_span_u32(self.editing_text_len());
             let Some(row) = rows.get(index) else {
                 // 结束组字允许无效索引回落原文，不能让 finish 的循环停在同一笔上。
                 let text = self.raw_with_cases().to_owned();
+                self.committed_spans.push(CommittedPinyinSpan {
+                    raw_consumed_bytes: 0,
+                    raw_advance_bytes: raw_len,
+                    is_exact_uncorrected_full_pinyin: false,
+                    explicit_pick: origin.is_explicit_pick(),
+                    resets_composition: true,
+                });
                 self.reset_composition();
                 self.chain.reset();
                 return KeyResult::committed(text);
@@ -192,6 +225,13 @@ impl InputSession {
             if english {
                 text.push(' ');
             }
+            self.committed_spans.push(CommittedPinyinSpan {
+                raw_consumed_bytes: 0,
+                raw_advance_bytes: raw_len,
+                is_exact_uncorrected_full_pinyin: false,
+                explicit_pick: origin.is_explicit_pick(),
+                resets_composition: true,
+            });
             self.reset_composition();
             self.chain.reset();
             return KeyResult::committed(text);
@@ -202,11 +242,11 @@ impl InputSession {
                 return result;
             }
         }
-        self.commit_plain(index)
+        self.commit_plain(index, origin)
     }
 
     /// input_session.cpp:828-956.
-    fn commit_plain(&mut self, index: usize) -> KeyResult {
+    fn commit_plain(&mut self, index: usize, origin: CommitOrigin) -> KeyResult {
         // 「📅日期」入口不上屏：候选窗换成这一组的全部格式，组字原样留着（`EnterDateTimeCandidatePage`）。
         if let Some(keyword) = self.date_time_menu_keyword_at(index) {
             self.enter_date_time_menu(&keyword);
@@ -216,6 +256,9 @@ impl InputSession {
         if let Some(result) = self.commit_literal_candidate(index) {
             return result;
         }
+        let had_non_end_caret = self
+            .caret
+            .is_some_and(|caret| caret < self.editing_text_len());
         // A selection made while a caret prefix is decoded leaves prefix mode: the rest of the composition decodes whole again.
         self.caret = None;
         // A Zhuyin commit is the converted text, whatever the list shows: its rows are choices inside the conversion, made through `select_in_open_list`. The pending syllable is dropped, nothing is learned, and a composition that converted nothing yet commits nothing.
@@ -234,6 +277,7 @@ impl InputSession {
             diagnostic,
         };
         if self.local_mode != LocalInputMode::None {
+            let raw_len = saturating_span_u32(self.editing_text_len());
             let text = self
                 .candidates()
                 .get(index)
@@ -241,6 +285,15 @@ impl InputSession {
             let diagnostic = self
                 .ranking_index(index)
                 .and_then(|learn_index| self.learn_candidate(learn_index));
+            if text.is_some() {
+                self.committed_spans.push(CommittedPinyinSpan {
+                    raw_consumed_bytes: 0,
+                    raw_advance_bytes: raw_len,
+                    is_exact_uncorrected_full_pinyin: false,
+                    explicit_pick: origin.is_explicit_pick(),
+                    resets_composition: true,
+                });
+            }
             self.chain.reset();
             self.reset_composition();
             return committed(text, diagnostic);
@@ -324,7 +377,12 @@ impl InputSession {
         let diagnostic = self
             .ranking_index(index)
             .and_then(|learn_index| self.learn_candidate(learn_index));
-        self.commit_selection(selected, text, diagnostic)
+        let effective_origin = if had_non_end_caret {
+            CommitOrigin::CaretEdit
+        } else {
+            origin
+        };
+        self.commit_selection(selected, text, diagnostic, effective_origin)
     }
 
     /// 拼音组字里上屏选中的行（`None` 是上屏 `text` 本身）之后的事：记个人上下文、推进组字或者结束组字、造词。`diagnostic` 是已经做过的学习留下的诊断。整句改字上屏改好的整句时也走这里。
@@ -333,6 +391,7 @@ impl InputSession {
         selected: Option<WordItem>,
         text: Option<String>,
         mut diagnostic: Option<String>,
+        origin: CommitOrigin,
     ) -> KeyResult {
         let committed = |text: Option<String>, diagnostic: Option<String>| KeyResult {
             handled: true,
@@ -340,6 +399,15 @@ impl InputSession {
             diagnostic,
         };
         let Some(selected) = selected else {
+            if text.is_some() {
+                self.committed_spans.push(CommittedPinyinSpan {
+                    raw_consumed_bytes: 0,
+                    raw_advance_bytes: saturating_span_u32(self.editing_text_len()),
+                    is_exact_uncorrected_full_pinyin: false,
+                    explicit_pick: origin.is_explicit_pick(),
+                    resets_composition: true,
+                });
+            }
             self.record_context_into(&mut diagnostic, None, false, false);
             self.chain.last_pick = None;
             self.reset_composition();
@@ -356,6 +424,13 @@ impl InputSession {
             && !self.dedicated_english
             && follows_pinyin)
         {
+            self.committed_spans.push(CommittedPinyinSpan {
+                raw_consumed_bytes: 0,
+                raw_advance_bytes: saturating_span_u32(self.editing_text_len()),
+                is_exact_uncorrected_full_pinyin: false,
+                explicit_pick: origin.is_explicit_pick(),
+                resets_composition: true,
+            });
             self.record_context_into(&mut diagnostic, Some(&selected), false, false);
             self.chain.last_pick = None;
             self.reset_composition();
@@ -380,7 +455,14 @@ impl InputSession {
                 )
             };
         let opens_composition = self.phrase_progress.word.is_empty();
+        let (mut committed_span, full_editing_len) =
+            self.measure_committed_pinyin_span(&selected, origin);
         let transition = self.advance_composition_after_selection(&selected);
+        if !transition.continues_composition {
+            committed_span.raw_advance_bytes = full_editing_len;
+            committed_span.resets_composition = true;
+        }
+        self.committed_spans.push(committed_span);
         self.record_context_into(
             &mut diagnostic,
             Some(&selected),
@@ -475,6 +557,165 @@ impl InputSession {
             self.record_personal_context(selected, learned_sentence_word, composition_left)
         {
             diagnostic.get_or_insert(context_diagnostic);
+        }
+    }
+
+    fn measure_committed_pinyin_span(
+        &self,
+        selected: &WordItem,
+        origin: CommitOrigin,
+    ) -> (CommittedPinyinSpan, u32) {
+        let full_editing_len = saturating_span_u32(self.editing_text_len());
+        let explicit_pick = origin.is_explicit_pick();
+        if self.scheme() != SchemeType::Quanpin
+            || self.engine.wubi_pinyin_lookup_active()
+            || selected.scheme != SchemeType::Quanpin
+        {
+            return (
+                CommittedPinyinSpan {
+                    raw_consumed_bytes: 0,
+                    raw_advance_bytes: 0,
+                    is_exact_uncorrected_full_pinyin: false,
+                    explicit_pick,
+                    resets_composition: false,
+                },
+                full_editing_len,
+            );
+        }
+
+        let request = self.engine.request();
+        let raw = request.raw_input.as_str();
+        let raw_with_cases = if request.raw_input_with_cases.is_empty() {
+            raw
+        } else {
+            request.raw_input_with_cases.as_str()
+        };
+        let cased_without_helpcodes: Cow<'_, str> = if request.enable_quanpin_helpcode {
+            Cow::Owned(strip_active_helpcodes_with_cases(raw, raw_with_cases))
+        } else {
+            Cow::Borrowed(raw_with_cases)
+        };
+        let effective_len = if selected.corrected_from.is_empty() {
+            selected
+                .pinyin
+                .bytes()
+                .filter(|&byte| byte != b'\'')
+                .count()
+        } else {
+            selected.corrected_from.len()
+        };
+        let consumed = raw_length_for_effective_prefix(&cased_without_helpcodes, effective_len)
+            .min(cased_without_helpcodes.len());
+        let trailing_seps = cased_without_helpcodes[consumed..]
+            .bytes()
+            .take_while(|&byte| byte == b'\'')
+            .count();
+        let advance = consumed.saturating_add(trailing_seps);
+
+        let eligible_mode = !matches!(
+            origin,
+            CommitOrigin::PinnedConversion | CommitOrigin::CaretEdit
+        ) && self.local_mode == LocalInputMode::None
+            && !self.dedicated_english
+            && !self.has_literal_input()
+            && self.caret.is_none()
+            && !self.caret_edit.active
+            && self.caret_edit.held.is_empty();
+        let eligible_source = matches!(
+            selected.source,
+            CandidateSource::Database
+                | CandidateSource::UserDatabase
+                | CandidateSource::Generated
+                | CandidateSource::Collocation
+                | CandidateSource::NeuralKeyboard
+        );
+        let fold_byte = |byte: u8| match byte.to_ascii_lowercase() {
+            b'v' => b'u',
+            lower => lower,
+        };
+        let is_exact = eligible_mode
+            && eligible_source
+            && consumed > 0
+            && (selected.corrected_from.is_empty()
+                || selected
+                    .corrected_from
+                    .bytes()
+                    .filter(|&byte| byte != b'\'')
+                    .map(fold_byte)
+                    .eq(selected
+                        .canonical_pinyin
+                        .bytes()
+                        .filter(|&byte| byte != b'\'')
+                        .map(fold_byte)))
+            && !selected.fuzzy
+            && canonical_pinyin_is_valid_for_word(&selected.canonical_pinyin, &selected.word)
+            && {
+                let consumed_slice = &cased_without_helpcodes[..consumed];
+                consumed_slice
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'\'')
+                    && exact_umlaut_segments_match(
+                        consumed_slice,
+                        &selected.pinyin,
+                        &selected.canonical_pinyin,
+                    )
+            };
+
+        (
+            CommittedPinyinSpan {
+                raw_consumed_bytes: saturating_span_u32(consumed),
+                raw_advance_bytes: saturating_span_u32(advance),
+                is_exact_uncorrected_full_pinyin: is_exact,
+                explicit_pick,
+                resets_composition: false,
+            },
+            full_editing_len,
+        )
+    }
+}
+
+fn exact_umlaut_segments_match(consumed_slice: &str, pinyin: &str, canonical: &str) -> bool {
+    let mut raw_bytes = consumed_slice.bytes().filter(|&byte| byte != b'\'');
+    let mut typed_iter = pinyin.split('\'');
+    let mut canon_iter = canonical.split('\'');
+    let mut raw_buf = [0u8; MAX_SYLLABLE_LENGTH];
+    let mut norm_buf = [0u8; MAX_SYLLABLE_LENGTH];
+    loop {
+        match (typed_iter.next(), canon_iter.next()) {
+            (None, None) => return raw_bytes.next().is_none(),
+            (Some(typed), Some(canon)) => {
+                let len = typed.len();
+                if typed != canon || len == 0 || len > MAX_SYLLABLE_LENGTH {
+                    return false;
+                }
+                for slot in &mut raw_buf[..len] {
+                    let Some(byte) = raw_bytes.next() else {
+                        return false;
+                    };
+                    *slot = byte;
+                }
+                let raw_seg = &raw_buf[..len];
+                if intact_piece(raw_seg).is_none() {
+                    return false;
+                }
+                norm_buf[..len].copy_from_slice(raw_seg);
+                if len == 3
+                    && norm_buf[1] == b'u'
+                    && norm_buf[2] == b'e'
+                    && matches!(norm_buf[0], b'n' | b'l')
+                {
+                    norm_buf[1] = b'v';
+                } else if len >= 2
+                    && norm_buf[1] == b'v'
+                    && matches!(norm_buf[0], b'j' | b'q' | b'x' | b'y')
+                {
+                    norm_buf[1] = b'u';
+                }
+                if &norm_buf[..len] != typed.as_bytes() {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
 }

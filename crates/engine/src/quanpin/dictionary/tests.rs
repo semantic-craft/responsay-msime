@@ -2007,5 +2007,76 @@ fn long_row_cache_batch_lets_a_waiting_writer_commit() {
     drop(batch);
 }
 
+#[test]
+fn typo_span_cache_4096_and_sentence_recall_cover_coincidental_tiles_and_final_typos() {
+    assert_eq!(TYPO_SPAN_CACHE_CAPACITY, 4096);
+
+    let fixture = Fixture::new();
+    fixture
+        .insert("wo'men", "我们", 500_000)
+        .insert("dou'zai", "都在", 300_000)
+        .insert("xue'xi", "学习", 400_000)
+        .insert("ren'gong", "人工", 300_000)
+        .insert("zhi'nen", "稚嫩", 30_185)
+        .insert("zhi'neng", "智能", 255_659)
+        .insert("ren'gong'zhi'neng", "人工智能", 290_784)
+        .insert("jun'tian", "均田", 524)
+        .insert("jin'tian", "今天", 900_000)
+        .insert("tian'qi", "天气", 500_000)
+        .insert("jin'tian'tian'qi", "今天天气", 1_755_608)
+        .insert("cheng'xu", "程序", 551_678)
+        .insert("yan", "严", 80_000)
+        .insert("cheng'xu'yuan", "程序员", 421_443)
+        .insert("bu'ke", "不可", 299_046)
+        .insert("nen", "嫩", 40_000)
+        .insert("bu'ke'neng", "不可能", 822_673)
+        .insert("zen'me", "怎么", 2_215_995)
+        .insert("ba", "吧", 600_000)
+        .insert("zen'me'ban", "怎么办", 499_128)
+        .insert("wo'shi", "我是", 800_000)
+        .insert("zhong'guo", "中国", 4_037_650)
+        .insert("re", "热", 300_000)
+        .insert("zhong'guo'ren", "中国人", 1_200_000)
+        .insert("wo'shi'zhong'guo'ren", "我是中国人", 617_771);
+
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    let incremental_prefixes = [
+        ("wo'men'dou", "womendou"),
+        ("wo'men'dou'zai", "womendouzai"),
+        ("wo'men'dou'zai'xue", "womendouzaixue"),
+        ("wo'men'dou'zai'xue'xi", "womendouzaixuexi"),
+        ("wo'men'dou'zai'xue'xi'ren", "womendouzaixuexiren"),
+        ("wo'men'dou'zai'xue'xi'ren'gong", "womendouzaixuexirengong"),
+        (
+            "wo'men'dou'zai'xue'xi'ren'gong'zhi",
+            "womendouzaixuexirengongzhi",
+        ),
+    ];
+    for (seg, raw) in incremental_prefixes {
+        let _ = query(&mut dictionary, raw, seg, ALL_FOUR);
+    }
+
+    for (raw, seg, expected) in [
+        ("rengongzhinen", "ren'gong'zhi'nen", "人工智能"),
+        (
+            "womendouzaixuexirengongzhinen",
+            "wo'men'dou'zai'xue'xi'ren'gong'zhi'nen",
+            "我们都在学习人工智能",
+        ),
+        ("juntiantianqi", "jun'tian'tian'qi", "今天天气"),
+        ("chengxuyan", "cheng'xu'yan", "程序员"),
+        ("bukenen", "bu'ke'nen", "不可能"),
+        ("zenmeba", "zen'me'ba", "怎么办"),
+        ("woshizhongguore", "wo'shi'zhong'guo're", "我是中国人"),
+    ] {
+        let rows = query(&mut dictionary, raw, seg, ALL_FOUR);
+        assert!(
+            words(&rows).contains(&expected),
+            "{raw} ({seg}) missing {expected}: {:?}",
+            words(&rows)
+        );
+    }
+}
+
 #[path = "path_page_compaction_tests.rs"]
 mod path_page_compaction_tests;

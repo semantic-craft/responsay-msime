@@ -434,6 +434,10 @@ fn correction_index() -> &'static CompactCorrectionIndex {
     })
 }
 
+pub(crate) fn warm_correction_index() {
+    let _ = correction_index();
+}
+
 const NO_PREDECESSOR: usize = usize::MAX;
 const SMALL_FINALIZE_BEAM: usize = 36;
 

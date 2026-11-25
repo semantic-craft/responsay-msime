@@ -77,7 +77,9 @@ pub use nine_key::{GridHelpcodeOp, KeyGrid};
 pub use paths::RuntimePaths;
 pub use pinyin::glide::{GlideKeyboard, GlidePoint};
 pub use punctuation::{BracketMarks, PunctuationMarks, QuoteMarks};
-pub use session::{Clock, HelpcodeTrigger, Session, SessionOptions, SessionSnapshot};
+pub use session::{
+    Clock, CommittedPinyinSpan, HelpcodeTrigger, Session, SessionOptions, SessionSnapshot,
+};
 pub use types::{
     autocorrect_type, fuzzy_rule, request_autocorrect_mask, CandidateEdge, CandidateSource,
     Command, CommandTableEntry, CommandTranslationQuery, EnglishInputOptions, FirstPageRows,
@@ -172,4 +174,14 @@ pub fn release_japanese_dictionary_cache() {
 /// 放掉进程里为下一个会话留着、没有会话在用的整句联想 n-gram store（连同它的模型和日志连接）。正在用的会话不受影响；之后第一个会话重新读日志。和 [`release_japanese_dictionary_cache`] 一样由宿主的清缓存、内存告警动作调用。
 pub fn release_idle_personal_models() {
     user_dictionary::ngram_store::release_idle();
+}
+
+/// Initializes the in-memory Quanpin autocorrect, syllable-typo, and syllable-edit static tables
+/// without opening any SQLite database or creating a [`Session`].
+pub fn warm_quanpin_autocorrect() {
+    let _ = pinyin::syllables::intact_pinyin_set();
+    let _ = pinyin::syllables::prefix_pinyin_set();
+    pinyin::autocorrect::warm_correction_index();
+    let _ = pinyin::typos::syllable_typos("");
+    quanpin::typo_edges::warm_syllable_trie();
 }

@@ -280,6 +280,15 @@ impl InputSession {
         let rest = self.raw_with_cases()[consumed..]
             .trim_start_matches('\'')
             .to_owned();
+        let advance = self.raw_with_cases().len().saturating_sub(rest.len());
+        self.committed_spans
+            .push(super::options::CommittedPinyinSpan {
+                raw_consumed_bytes: 0,
+                raw_advance_bytes: u32::try_from(advance).unwrap_or(u32::MAX),
+                is_exact_uncorrected_full_pinyin: false,
+                explicit_pick: false,
+                resets_composition: rest.is_empty(),
+            });
         self.reset_composition();
         self.chain.reset();
         if !rest.is_empty() {

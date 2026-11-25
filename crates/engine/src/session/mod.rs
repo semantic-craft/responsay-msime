@@ -49,7 +49,7 @@ use crate::user_dictionary::ngram_store::{flush_journal, note_settled};
 use crate::types::FirstPageRows;
 pub use clock::{Clock, LocalClock};
 use input::InputSession;
-pub use options::{HelpcodeTrigger, SessionOptions, SessionSnapshot};
+pub use options::{CommittedPinyinSpan, HelpcodeTrigger, SessionOptions, SessionSnapshot};
 
 pub struct Session {
     // 输入会话包含多套提供者和候选状态；嵌套构造时只移动堆指针，保留编辑器的小栈。
@@ -144,6 +144,12 @@ impl Session {
 
     fn candidates_may_change(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        self.input.committed_spans.clear();
+    }
+
+    /// Committed Pinyin segment records produced during the most recent session operation.
+    pub fn last_committed_pinyin_spans(&self) -> &[CommittedPinyinSpan] {
+        self.input.committed_spans.as_slice()
     }
 
     /// 会话建立时定下的双拼方案（内置的表，或校验过的用户表）。
@@ -368,6 +374,7 @@ impl Session {
 
     /// 一条编辑命令。`CommitRaw` 原样上屏，专用英文里打的词学进英文词库（`SessionOptions::learn_english_on_enter`），`learn_typed_spellings_on_enter` 打开时还学临时模式与拼不成音节的拼音；`CommitRawWithoutLearning` 原样上屏、不学英文词。规则见 `session/raw_commit.rs`。
     pub fn command(&mut self, command: Command) -> KeyResult {
+        self.input.committed_spans.clear();
         if self.requires_candidate_selection()
             && matches!(
                 command,
@@ -446,6 +453,7 @@ impl Session {
 
     /// Finishes the composition and appends the Chinese mark; unhandled when Chinese punctuation is off or locked to ASCII, or the key has no mark.
     pub fn punctuation(&mut self, value: u8) -> KeyResult {
+        self.input.committed_spans.clear();
         if self.requires_candidate_selection() {
             self.input.pending_touch = None;
             return self
@@ -679,6 +687,19 @@ impl Session {
         self.input.set_wubi_mixed_pinyin(enabled);
     }
 
+    /// Live Quanpin/Shuangpin autocorrect bitmask (`autocorrect_type::*`); refreshes an active composition in place.
+    pub fn set_autocorrect_types(&mut self, types: u32) {
+        self.candidates_may_change();
+        self.input.set_autocorrect_types(types);
+    }
+
+    /// Live mixed-English candidate switch (`SessionOptions::english.mixed_candidates`); refreshes 26-key and nine-key compositions in place.
+    pub fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        self.candidates_may_change();
+        self.input.set_english_mixed_candidates(enabled);
+        self.nine_key.set_english_mixed_candidates(enabled);
+    }
+
     /// 五笔拼音混输是否打开。
     pub fn wubi_mixed_pinyin(&self) -> bool {
         self.input.engine.wubi_input_options().mixed_pinyin
@@ -845,6 +866,7 @@ impl Session {
 
     /// Hand over the candidates withheld from a single-letter query; whether the list grew.
     pub fn expand_initial_candidates(&mut self) -> bool {
+        self.input.committed_spans.clear();
         self.input.pending_touch = None;
         // Nine-key rows come from the spelling session rather than a dictionary query, so nothing is withheld there.
         if self.nine_key.active() {

@@ -79,7 +79,7 @@ fn remove_manual_delimiters_cow(raw: &str) -> Cow<'_, str> {
     }
 }
 
-fn remove_delimiters(segmented: &str) -> String {
+pub(super) fn remove_delimiters(segmented: &str) -> String {
     let mut result = String::with_capacity(segmented.len());
     result.extend(segmented.chars().filter(|c| *c != '\''));
     result
@@ -142,7 +142,7 @@ pub(super) fn normalize_canonical_pinyin_for_word(pinyin: &str, word: &str) -> S
 }
 
 // 只读调用直接复用校验结论；需要保存读音的调用仍由拥有型接口复制结果。
-fn canonical_pinyin_is_valid_for_word(pinyin: &str, word: &str) -> bool {
+pub(super) fn canonical_pinyin_is_valid_for_word(pinyin: &str, word: &str) -> bool {
     if pinyin.is_empty() {
         return false;
     }

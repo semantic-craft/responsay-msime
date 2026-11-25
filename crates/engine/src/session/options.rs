@@ -200,6 +200,65 @@ pub struct HelpcodeTrigger {
     pub position: usize,
 }
 
+/// Byte-consumption and exactness record for one committed Pinyin segment produced during the most
+/// recent [`crate::Session`] operation. Recorded purely in memory even when
+/// [`SessionOptions::learning`] is `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommittedPinyinSpan {
+    pub raw_consumed_bytes: u32,
+    pub raw_advance_bytes: u32,
+    pub is_exact_uncorrected_full_pinyin: bool,
+    pub explicit_pick: bool,
+    pub resets_composition: bool,
+}
+
+const INLINE_COMMITTED_SPANS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub(super) struct CommittedSpanList {
+    inline: [CommittedPinyinSpan; INLINE_COMMITTED_SPANS],
+    len: usize,
+    overflow: Vec<CommittedPinyinSpan>,
+}
+
+impl Default for CommittedSpanList {
+    fn default() -> Self {
+        Self {
+            inline: [CommittedPinyinSpan::default(); INLINE_COMMITTED_SPANS],
+            len: 0,
+            overflow: Vec::new(),
+        }
+    }
+}
+
+impl CommittedSpanList {
+    pub(super) fn clear(&mut self) {
+        self.len = 0;
+        self.overflow.clear();
+    }
+
+    pub(super) fn push(&mut self, span: CommittedPinyinSpan) {
+        if self.overflow.is_empty() && self.len < INLINE_COMMITTED_SPANS {
+            self.inline[self.len] = span;
+            self.len += 1;
+            return;
+        }
+        if self.overflow.is_empty() {
+            self.overflow.reserve(INLINE_COMMITTED_SPANS * 2);
+            self.overflow.extend_from_slice(&self.inline[..self.len]);
+        }
+        self.overflow.push(span);
+    }
+
+    pub(super) fn as_slice(&self) -> &[CommittedPinyinSpan] {
+        if self.overflow.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.overflow
+        }
+    }
+}
+
 /// A value copy of the composition; safe to hand to another thread. `candidate_sources`, `candidate_annotations` and `candidate_answers_key` are aligned with `candidates`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SessionSnapshot {

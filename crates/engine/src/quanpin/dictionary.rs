@@ -74,7 +74,7 @@ mod path_page;
 use path_page::PathPage;
 
 pub const CACHE_CAPACITY: usize = 128;
-pub const TYPO_SPAN_CACHE_CAPACITY: usize = 512;
+pub const TYPO_SPAN_CACHE_CAPACITY: usize = 4096;
 /// 词网格的跨度查询结果按跨度缓存的条数。九键每按一键要对几十条切分各解一次词网格，这些切分大量共用同样的跨度，下一键又会重复上一键的大部分跨度，所以容量按一次长输入里出现的不同跨度数来定。
 pub const LATTICE_SPAN_CACHE_CAPACITY: usize = 4096;
 /// 按切分缓存的词典原始行（`query_segments_keyed_flat`、单字母的 `query_initial`、`query_longer_phrases` 和模糊前缀的批量查询）每种的条数。`cache` 只有 128 条，九键一键的几十条切分会把它整个挤掉；这一层只存与查询方式无关的词典行，命中时与直接查库完全一样。

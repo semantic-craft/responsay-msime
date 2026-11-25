@@ -160,7 +160,18 @@ impl InputSession {
         let mut text = String::new();
         let mut diagnostic = None;
         if let Some(prefix) = self.caret_edit.prefix_row.clone() {
+            let before_len = self.editing_text_len();
             diagnostic = self.consume_caret_prefix(&prefix);
+            let after_len = self.editing_text_len();
+            self.committed_spans
+                .push(super::options::CommittedPinyinSpan {
+                    raw_consumed_bytes: 0,
+                    raw_advance_bytes: u32::try_from(before_len.saturating_sub(after_len))
+                        .unwrap_or(u32::MAX),
+                    is_exact_uncorrected_full_pinyin: false,
+                    explicit_pick: false,
+                    resets_composition: false,
+                });
             text.push_str(&prefix.word);
         }
         self.caret = None;
@@ -176,7 +187,12 @@ impl InputSession {
             super::commit::clone_selected_candidate(&row, self.personal_context_applies());
         let word = row.word.to_string();
         text.push_str(&word);
-        let mut result = self.commit_selection(Some(selected), Some(word.clone()), diagnostic);
+        let mut result = self.commit_selection(
+            Some(selected),
+            Some(word.clone()),
+            diagnostic,
+            super::commit::CommitOrigin::CaretEdit,
+        );
         if result.commit.is_some() {
             result.commit = Some(text);
         }
