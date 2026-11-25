@@ -465,7 +465,7 @@ fn index_reverse_lookup(generation: &Path, dictionaries: GenerationDictionaries)
 }
 
 /// Copy through the SQLite backup API, which includes committed WAL content that a plain file copy of a live database would lose (RP:38-55).
-fn copy_database(source: &Path, target: &Path) -> Result<()> {
+pub(super) fn copy_database(source: &Path, target: &Path) -> Result<()> {
     if !is_real_file(source) {
         return Err(EngineError::failed(format!(
             "{}{}",

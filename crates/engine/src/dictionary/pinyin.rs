@@ -588,6 +588,26 @@ impl PinyinDatabase {
         column_i64(row, 0).ok()
     }
 
+    pub(crate) fn file_contains_word(path: &Path, key: &str, value: &str) -> bool {
+        let Ok(read_only_path) = crate::paths::sqlite_read_only_path_no_follow(path) else {
+            return false;
+        };
+        let Ok(connection) = Connection::open_with_flags(
+            read_only_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        let _ = connection.busy_timeout(BUSY_TIMEOUT);
+        let database = Self {
+            connection: Some(connection),
+            data_version: None,
+        };
+        database.find_weight(key, value).is_some()
+    }
+
     /// 插入原键、各非空段的首个字符、词值及 `INSERTED_WEIGHT`；调用方负责查重和键校验。
     pub fn insert_word(&self, key: &str, value: &str) -> Result<()> {
         let connection = self.writable()?;

@@ -7,7 +7,9 @@ use super::chain::Pick;
 use super::composition::canonical_pinyin_is_valid_for_word;
 use super::input::InputSession;
 use super::options::CommittedPinyinSpan;
+use crate::assets;
 use crate::diagnostics;
+use crate::dictionary::pinyin::PinyinDatabase;
 use crate::error::Result;
 use crate::pinyin::active_helpcode::strip_active_helpcodes_with_cases;
 use crate::pinyin::segment::{join_segments, split_segments};
@@ -19,7 +21,7 @@ use crate::types::{
     CandidateEdge, CandidateSource, KeyResult, LocalInputMode, PersonalDictionaryKind, SchemeType,
     WordItem,
 };
-use crate::user_dictionary::journal::is_user_inserted;
+use crate::user_dictionary::journal::{has_active_upsert, is_user_inserted};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommitOrigin {
@@ -447,12 +449,24 @@ impl InputSession {
             && {
                 let mut segments = split_segments(&selected.canonical_pinyin);
                 normalize_umlaut_aliases(&mut segments);
+                let canonical = join_segments(&segments);
                 is_user_inserted(
                     self.journal_path(),
                     PersonalDictionaryKind::Pinyin,
-                    &join_segments(&segments),
+                    &canonical,
                     &selected.word,
-                )
+                ) || (!self.mark_learned_words_user_inserted
+                    && has_active_upsert(
+                        self.journal_path(),
+                        PersonalDictionaryKind::Pinyin,
+                        &canonical,
+                        &selected.word,
+                    )
+                    && !PinyinDatabase::file_contains_word(
+                        &self.paths.resource(assets::MAIN_DICTIONARY),
+                        &canonical,
+                        &selected.word,
+                    ))
             };
         let opens_composition = self.phrase_progress.word.is_empty();
         let (mut committed_span, full_editing_len) =
@@ -530,10 +544,16 @@ impl InputSession {
         pinyin: &str,
         word: &str,
     ) -> Result<()> {
+        let user_inserted = self.mark_learned_words_user_inserted;
         self.canonical_phrase_engine()
-            .create_word_from_canonical_pinyin(pinyin, word)?;
+            .create_word_from_canonical_pinyin_with(pinyin, word, user_inserted)?;
         let profile = self.engine.wubi_input_options().profile;
-        if crate::user_dictionary::wubi_learning::learn(&self.paths, word, profile)? {
+        if crate::user_dictionary::wubi_learning::learn_with(
+            &self.paths,
+            word,
+            profile,
+            user_inserted,
+        )? {
             self.engine.reset_cache();
         }
         Ok(())

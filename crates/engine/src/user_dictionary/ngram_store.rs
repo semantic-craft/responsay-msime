@@ -901,6 +901,12 @@ pub(crate) fn invalidate_journal(user_db: &Path) {
     }
 }
 
+pub(crate) fn clear_journal(user_db: &Path) {
+    if let Some(store) = PersonalNgramStore::existing(user_db) {
+        store.clear_in_memory();
+    }
+}
+
 /// `forget_removed` on the journal's store, if it has one.
 pub(crate) fn forget_journal_rows(user_db: &Path, removed: &[PersonalTransition]) {
     if let Some(store) = PersonalNgramStore::existing(user_db) {
@@ -935,6 +941,28 @@ impl PersonalNgramStore {
         writer.origin = None;
         // 调用方随后可能替换文件，写连接与只读来源都必须关闭。
         lock(&self.settled).take();
+    }
+
+    fn clear_in_memory(&self) {
+        let mut writer = lock(&self.writer);
+        writer.connection = None;
+        writer.connection_file = None;
+        writer.origin = None;
+        writer.retry_after = None;
+        let mut pending = lock(&self.pending);
+        pending.clear();
+        self.write_failed.store(false, Ordering::Release);
+        self.probed.store(false, Ordering::Release);
+        let options = *self
+            .model
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .options();
+        *self.model_write() = PersonalNgram::new(options);
+        drop(pending);
+        lock(&self.settled).take();
+        self.version.fetch_add(1, Ordering::AcqRel);
+        self.invalidations.fetch_add(1, Ordering::AcqRel);
     }
 }
 

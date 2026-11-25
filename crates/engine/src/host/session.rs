@@ -192,6 +192,12 @@ impl Session {
         self.inner.set_prediction_allowed(allowed);
     }
 
+    pub fn set_learning_enabled(&mut self, enabled: bool) {
+        self.options.learning = enabled;
+        self.options.learn_english_on_enter = enabled;
+        self.inner.set_learning_enabled(enabled);
+    }
+
     /// 联想的词库续写多取一池留给模型排序，同 [`crate::Session::set_prediction_pool`]。
     pub fn set_prediction_pool(&mut self, enabled: bool) {
         self.inner.set_prediction_pool(enabled);

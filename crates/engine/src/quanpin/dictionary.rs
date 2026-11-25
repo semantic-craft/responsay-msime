@@ -52,7 +52,7 @@ use crate::types::{
     autocorrect_type, CandidateSource, FirstPageRows, FuzzyPinyinOptions, PersonalDictionaryKind,
     SentenceAssociationOptions, WordItem,
 };
-use crate::user_dictionary::journal::{has_matching_user_weight, record_user_insert};
+use crate::user_dictionary::journal::{has_matching_user_weight, record_learned_insert};
 use crate::user_dictionary::ngram_store::PersonalNgramStore;
 use crate::user_dictionary::typo_profile::PersonalTypoProfile;
 
@@ -793,7 +793,17 @@ impl QuanpinDictionary {
     }
 
     /// Umlaut-normalised canonical key, one complete syllable per Han character, no re-cut; an existing row is OK without a journal write (QD:1215-1268).
+    #[cfg(test)]
     pub fn create_word_from_canonical_pinyin(&mut self, pinyin: &str, word: &str) -> Result<()> {
+        self.create_word_from_canonical_pinyin_with(pinyin, word, true)
+    }
+
+    pub(crate) fn create_word_from_canonical_pinyin_with(
+        &mut self,
+        pinyin: &str,
+        word: &str,
+        user_inserted: bool,
+    ) -> Result<()> {
         // Online rows arrive with the typed spelling; they are stored under the nve/lve/ju keys queries resolve to.
         let mut segments = split_segments(pinyin);
         normalize_umlaut_aliases(&mut segments);
@@ -806,7 +816,7 @@ impl QuanpinDictionary {
         {
             return Err(EngineError::invalid(ENTRY_REJECTED));
         }
-        self.insert_new_word(&join_segments(&segments), word)
+        self.insert_new_word(&join_segments(&segments), word, user_inserted)
     }
 
     /// A change clears the row and series caches.
@@ -1086,11 +1096,10 @@ impl QuanpinDictionary {
                     let segments = segments.get_or_insert_with(|| {
                         resolve_cached_segments(segmentation_cache, raw, segmentation)
                     });
-                    if let Some((slice, geometry)) = key_geometry.and_then(|geom| {
-                        touch_slice(key_touches, touch_input, raw)
-                            .filter(|s| s.iter().any(Option::is_some))
-                            .map(|s| (s, geom))
-                    }) {
+                    if let Some((slice, geometry)) = touch_slice(key_touches, touch_input, raw)
+                        .filter(|s| s.iter().any(Option::is_some))
+                        .zip(key_geometry)
+                    {
                         resolve_series_query_with_touch(
                             raw,
                             segments,
@@ -1774,14 +1783,12 @@ impl QuanpinDictionary {
             None
         };
         let touched_slice = if typo_eligible && segments.len() >= 3 {
-            self.key_geometry.as_deref().and_then(|geometry| {
-                touch_slice(&self.key_touches, &self.touch_input, raw)
-                    .filter(|touches| {
-                        touches.iter().any(Option::is_some)
-                            && segments_align_with_raw(raw, segments, touches)
-                    })
-                    .map(|touches| (touches, geometry))
-            })
+            touch_slice(&self.key_touches, &self.touch_input, raw)
+                .filter(|touches| {
+                    touches.iter().any(Option::is_some)
+                        && segments_align_with_raw(raw, segments, touches)
+                })
+                .zip(self.key_geometry.as_deref())
         } else {
             None
         };
@@ -2135,11 +2142,10 @@ impl QuanpinDictionary {
             touch_sig.as_deref(),
             || {
                 let segments = resolve_cached_segments(segmentation_cache, raw, segmentation);
-                if let Some((slice, geometry)) = key_geometry.and_then(|geom| {
-                    touch_slice(key_touches, touch_input, raw)
-                        .filter(|s| s.iter().any(Option::is_some))
-                        .map(|s| (s, geom))
-                }) {
+                if let Some((slice, geometry)) = touch_slice(key_touches, touch_input, raw)
+                    .filter(|s| s.iter().any(Option::is_some))
+                    .zip(key_geometry)
+                {
                     resolve_series_query_with_touch(
                         raw,
                         &segments,
@@ -2158,7 +2164,7 @@ impl QuanpinDictionary {
     }
 
     /// Insert a row that is not there yet and journal it as the user's own (QD:1200-1212, QD:1234-1266). A row already present is success without a journal write.
-    fn insert_new_word(&mut self, key: &str, word: &str) -> Result<()> {
+    fn insert_new_word(&mut self, key: &str, word: &str, user_inserted: bool) -> Result<()> {
         if !self.database.is_open() {
             return Err(EngineError::failed(DICTIONARY_UNAVAILABLE));
         }
@@ -2167,13 +2173,14 @@ impl QuanpinDictionary {
         }
         self.database.insert_word(key, word)?;
         // The reference ignored a failed journal write. The row is in the working dictionary either way, so the caches are reset first; the error still reaches the caller, because a row missing from the journal is lost at the next generation.
-        let journaled = record_user_insert(
+        let journaled = record_learned_insert(
             &self.paths.user(USER_JOURNAL),
             PersonalDictionaryKind::Pinyin,
             key,
             word,
             INSERTED_WEIGHT,
             "",
+            user_inserted,
         );
         self.reset_cache();
         journaled

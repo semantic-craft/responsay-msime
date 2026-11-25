@@ -13,13 +13,36 @@ use crate::diagnostics;
 use crate::error::{EngineError, Result};
 use crate::paths::RuntimePaths;
 use crate::types::SchemeSet;
-use crate::user_dictionary::generation::{copy_private_file, merge_split_wubi, weakly_canonical};
+use crate::user_dictionary::generation::{
+    copy_database, copy_private_file, merge_split_wubi, weakly_canonical,
+};
 use crate::user_dictionary::journal::{
     checkpoint_journal, close_cached_journals, ensure_schema, open_database,
 };
+use crate::user_dictionary::replay::{replay, replay_english};
 
 /// SQLite files that sit beside the journal. A leftover `-wal` would bring the learned data the user just erased back on the next open.
 const JOURNAL_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+const CLEAR_AUTO_LEARNED_SQL: &str = "\
+DELETE FROM user_dictionary_operations WHERE user_inserted = 0;\
+DELETE FROM candidate_selection_state;\
+DELETE FROM fixed_candidate_positions;\
+DELETE FROM pick_transitions;\
+DELETE FROM pinyin_typo_counts;\
+DELETE FROM pinyin_autocorrect_suppressions;\
+DELETE FROM shuangpin_typo_counts;\
+DELETE FROM shuangpin_autocorrect_suppressions;\
+DELETE FROM pinned_candidates;\
+DELETE FROM personal_bigram;\
+DELETE FROM personal_trigram;\
+DELETE FROM quick_phrase_slots;";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetMode {
+    Full,
+    AutoLearnedOnly,
+}
 
 /// One file being swapped: the fresh copy is published over `target` while the original waits at `backup` until every file is in place.
 struct Replacement {
@@ -34,7 +57,7 @@ struct Replacement {
 ///
 /// 自己取独占的维护租约（`DictionaryAccess::try_maintenance`），在建好两个目录之后、动任何文件之前：还有会话或别的维护持着租约时以 `Busy`（`DICTIONARY_MAINTENANCE_BUSY`）失败，什么也不换。
 pub fn reset_learned_data(paths: &RuntimePaths) -> Result<()> {
-    reset(paths, true, true, true)
+    reset(paths, true, true, true, ResetMode::Full)
 }
 
 /// [`reset_learned_data`]，按代次准备时的方案集合（[`crate::prepare_runtime_paths_for`] 的 `schemes`）换回词库：只换回、只要求这个集合读的那几个，与准备代次的规则相同。不读 `msime-pinyin.db` 的集合不要求也不复制它；不要求 `msime-english.db` 的集合在资源目录带了它时换回它，没带时只清空日志。还有会话开着时以 `Busy` 失败，规则同 [`reset_learned_data`]。
@@ -45,12 +68,49 @@ pub fn reset_learned_data_for(paths: &RuntimePaths, schemes: SchemeSet) -> Resul
         main_dictionary,
         main_dictionary || schemes.requires_english_dictionary(),
         true,
+        ResetMode::Full,
     )
+}
+
+/// Clears only auto-learned state (`user_inserted = 0` operations, personal n-gram tables, typo profiles, pick transitions, pinned/fixed positions, selection counts, and `responsay_hotwords` rows with `manual = 0`), restores packaged dictionaries with `user_inserted = 1` manual operations replayed, and invalidates in-memory personal models while leaving `user_inserted = 1` and `responsay_hotwords` (`manual = 1`) manual entries untouched.
+pub fn reset_auto_learned_data(paths: &RuntimePaths) -> Result<()> {
+    reset(paths, true, true, true, ResetMode::AutoLearnedOnly)
+}
+
+/// [`reset_auto_learned_data`] scoped to the dictionaries prepared for `schemes`.
+pub fn reset_auto_learned_data_for(paths: &RuntimePaths, schemes: SchemeSet) -> Result<()> {
+    let main_dictionary = schemes.reads_main_dictionary();
+    reset(
+        paths,
+        main_dictionary,
+        main_dictionary || schemes.requires_english_dictionary(),
+        true,
+        ResetMode::AutoLearnedOnly,
+    )
+}
+
+/// Scrubs only `msime_user.db` under `user_data` (preserving `user_inserted = 1` and `responsay_hotwords` with `manual = 1`) and invalidates in-memory personal models, acquiring an exclusive maintenance lease on `user_data`.
+pub fn reset_auto_learned_journal(user_data: &Path) -> Result<()> {
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    let absolute = user_data.has_root();
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    let absolute = user_data.is_absolute();
+    if !absolute {
+        return Err(EngineError::invalid(
+            diagnostics::RUNTIME_DIRECTORIES_MUST_BE_ABSOLUTE,
+        ));
+    }
+    reject_redirected_directory(user_data)?;
+    fs::create_dir_all(user_data)?;
+    reject_redirected_directory(user_data)?;
+    let _access = crate::DictionaryAccess::try_maintenance(user_data, user_data)?
+        .ok_or_else(|| EngineError::busy(diagnostics::DICTIONARY_MAINTENANCE_BUSY))?;
+    scrub_journal_in_place(&user_data.join(assets::USER_JOURNAL))
 }
 
 /// [`reset_learned_data`]，`main_dictionary` 为假（代次里没有 `msime-pinyin.db`，见 `SchemeSet::reads_main_dictionary`）时不要求也不复制 `msime-pinyin.db`，`msime-english.db` 在资源目录里有才换回，然后清空日志。不取维护租约，调用方（host 门面背后的 host-api）已经持有。
 pub fn reset_learned_data_with(paths: &RuntimePaths, main_dictionary: bool) -> Result<()> {
-    reset(paths, main_dictionary, main_dictionary, false)
+    reset(paths, main_dictionary, main_dictionary, false, ResetMode::Full)
 }
 
 /// `english_required` 为假时 `msime-english.db` 在资源目录里有才换回。`take_lease` 为真时自己取维护租约，持到换完为止。
@@ -59,6 +119,7 @@ fn reset(
     main_dictionary: bool,
     english_required: bool,
     take_lease: bool,
+    mode: ResetMode,
 ) -> Result<()> {
     paths.validate()?;
     if weakly_canonical(&paths.resources)? == weakly_canonical(&paths.dictionaries)? {
@@ -119,16 +180,7 @@ fn reset(
         .collect();
     let journal_temporary = replacements[names.len()].temporary.clone();
 
-    // 新日志用独立连接，发布前关闭；只保留本机时间下限，不保留学习行。
-    let prepared = (|| -> Result<()> {
-        let connection = open_database(
-            &journal_temporary,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )?;
-        ensure_schema(&connection)?;
-        super::learning_floor::advance_in(&connection, "main", reset_floor)?;
-        Ok(())
-    })();
+    let prepared = stage_journal(&journal, &journal_temporary, reset_floor, mode);
     if prepared.is_err() {
         remove_ignoring_errors(&journal_temporary);
         return Err(EngineError::failed(diagnostics::RESET_JOURNAL_FAILED));
@@ -138,8 +190,11 @@ fn reset(
         &mut replacements,
         &paths.resources,
         main_dictionary,
+        english,
         &sources,
         &journal,
+        &journal_temporary,
+        mode,
     );
     match swapped {
         Ok(()) => {
@@ -147,6 +202,9 @@ fn reset(
             for replacement in &replacements {
                 remove_ignoring_errors(&replacement.backup);
             }
+            super::ngram_store::clear_journal(&journal);
+            super::typo_profile::PersonalTypoProfile::invalidate_journal(&journal);
+            close_cached_journals();
             Ok(())
         }
         Err(error) => {
@@ -156,12 +214,113 @@ fn reset(
     }
 }
 
+fn scrub_journal_in_place(journal: &Path) -> Result<()> {
+    close_cached_journals();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
+        .to_string();
+    let reset_floor = super::learning_floor::read_path(journal)?;
+    checkpoint_journal(journal);
+    let mut replacements = [Replacement {
+        temporary: affixed(journal, ".reset.", &stamp),
+        backup: affixed(journal, ".backup.", &stamp),
+        target: journal.to_path_buf(),
+        had_original: false,
+        published: false,
+    }];
+    let journal_temporary = replacements[0].temporary.clone();
+    if stage_journal(
+        journal,
+        &journal_temporary,
+        reset_floor,
+        ResetMode::AutoLearnedOnly,
+    )
+    .is_err()
+    {
+        remove_ignoring_errors(&journal_temporary);
+        return Err(EngineError::failed(diagnostics::RESET_JOURNAL_FAILED));
+    }
+    match swap(
+        &mut replacements,
+        Path::new(""),
+        false,
+        false,
+        &[],
+        journal,
+        &journal_temporary,
+        ResetMode::AutoLearnedOnly,
+    ) {
+        Ok(()) => {
+            remove_ignoring_errors(&replacements[0].backup);
+            super::ngram_store::clear_journal(journal);
+            super::typo_profile::PersonalTypoProfile::invalidate_journal(journal);
+            close_cached_journals();
+            Ok(())
+        }
+        Err(error) => {
+            restore(&replacements);
+            Err(error)
+        }
+    }
+}
+
+fn stage_journal(
+    journal: &Path,
+    journal_temporary: &Path,
+    reset_floor: u64,
+    mode: ResetMode,
+) -> Result<()> {
+    if mode == ResetMode::AutoLearnedOnly && is_real_file(journal) {
+        copy_database(journal, journal_temporary)?;
+        let connection = open_database(journal_temporary, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        ensure_schema(&connection)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let scrubbed = (|| -> Result<()> {
+            super::learning_floor::advance_in(&connection, "main", reset_floor)?;
+            connection.execute_batch(CLEAR_AUTO_LEARNED_SQL)?;
+            let has_hotwords_manual: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('responsay_hotwords') WHERE name='manual')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_hotwords_manual {
+                connection.execute_batch("DELETE FROM responsay_hotwords WHERE manual = 0;")?;
+            }
+            Ok(())
+        })();
+        match scrubbed {
+            Ok(()) => {
+                connection.execute_batch("COMMIT")?;
+                let _ = connection.execute_batch("VACUUM");
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+    }
+
+    let connection = open_database(
+        journal_temporary,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    ensure_schema(&connection)?;
+    super::learning_floor::advance_in(&connection, "main", reset_floor)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn swap(
     replacements: &mut [Replacement],
     resources: &Path,
     main_dictionary: bool,
+    english: bool,
     sources: &[PathBuf],
     journal: &Path,
+    journal_temporary: &Path,
+    mode: ResetMode,
 ) -> Result<()> {
     // A plain copy, as the reference made: the packaged bundle is immutable, so it has no WAL to lose.
     for (source, replacement) in sources.iter().zip(replacements.iter()) {
@@ -172,6 +331,20 @@ fn swap(
     if main_dictionary {
         merge_split_wubi(resources, &replacements[0].temporary)
             .map_err(|_| EngineError::failed(diagnostics::RESET_STAGE_DICTIONARIES_FAILED))?;
+    }
+    if mode == ResetMode::AutoLearnedOnly {
+        let replayed = match (main_dictionary, english) {
+            (true, true) => replay(
+                journal_temporary,
+                &replacements[0].temporary,
+                &replacements[1].temporary,
+            ),
+            (false, true) => replay_english(journal_temporary, &replacements[0].temporary),
+            _ => crate::ReplayResult::default(),
+        };
+        if replayed.failed != 0 || !replayed.error.is_empty() {
+            return Err(EngineError::failed(diagnostics::RESET_JOURNAL_FAILED));
+        }
     }
     for replacement in replacements.iter_mut() {
         replacement.had_original = replacement.target.exists();
@@ -781,5 +954,264 @@ mod tests {
             .filter(|name| name.starts_with('.') && name != crate::access::LOCK_FILE)
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn reset_auto_learned_data_clears_learned_state_and_caches_while_preserving_manual_entries() {
+        use crate::lattice::personal::PersonalTransition;
+        use crate::types::ShuangpinProfileKind;
+        use crate::user_dictionary::ngram_store::{flush_all, PersonalNgramStore};
+        use crate::user_dictionary::typo_profile::{PersonalTypoProfile, ShuangpinTypoOutcome};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(root.path());
+        sql(
+            &paths.resource(assets::MAIN_DICTIONARY),
+            "CREATE TABLE tbl_2_n(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+             INSERT INTO tbl_2_n VALUES('ni''hao','nh','你好',200),('ni''hao','nh','拟好',100);
+             CREATE TABLE tbl_4_f(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+             CREATE TABLE wubi86(key TEXT,value TEXT,weight INTEGER);",
+        );
+        sql(
+            &paths.resource(assets::ENGLISH_DICTIONARY),
+            "CREATE TABLE english_words(word TEXT,display TEXT,weight INTEGER);
+             INSERT INTO english_words VALUES('hello','hello',100);",
+        );
+        for name in [assets::MAIN_DICTIONARY, assets::ENGLISH_DICTIONARY] {
+            fs::copy(paths.resource(name), paths.dictionary(name)).unwrap();
+        }
+
+        let journal = paths.user(assets::USER_JOURNAL);
+        sql(
+            &journal,
+            "CREATE TABLE user_dictionary_operations(
+                dictionary TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('upsert','delete')),
+                weight INTEGER NOT NULL DEFAULT 0,display TEXT NOT NULL DEFAULT '',
+                user_inserted INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+                backup_timestamp REAL,
+                PRIMARY KEY(dictionary,key,value));
+             CREATE TABLE responsay_hotwords(
+                term TEXT PRIMARY KEY NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                weight INTEGER NOT NULL DEFAULT 1000,
+                manual INTEGER NOT NULL DEFAULT 1);
+             INSERT INTO responsay_hotwords(term,updated_at,deleted,weight,manual)
+                VALUES('法言热词',1700000001,0,1000,1),('自动热词',1700000002,0,100,0);
+             INSERT INTO user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at,backup_timestamp)
+                VALUES
+                ('pinyin','fa''yan''shu''ru','法言输入','upsert',1000,'',1,1700000003,1700000003.5),
+                ('english','responsay','Responsay','upsert',1000,'Responsay',1,1700000004,1700000004.25),
+                ('pinyin','ni''hao','拟好','upsert',250,'',0,1700000005,NULL),
+                ('english','autoword','AutoWord','upsert',10,'AutoWord',0,1700000006,NULL);",
+        );
+        sql(
+            &paths.dictionary(assets::MAIN_DICTIONARY),
+            "UPDATE tbl_2_n SET weight=250 WHERE value='拟好';
+             INSERT INTO tbl_2_n VALUES('zi''zao','zz','自造',10000);",
+        );
+        sql(
+            &paths.dictionary(assets::ENGLISH_DICTIONARY),
+            "INSERT INTO english_words VALUES('autoword','AutoWord',10);",
+        );
+
+        let ngram_store = PersonalNgramStore::for_journal(&journal);
+        ngram_store
+            .record(&[PersonalTransition {
+                earlier: String::new(),
+                previous: "你好".to_owned(),
+                word: "世界".to_owned(),
+                times: 4,
+            }])
+            .unwrap();
+        flush_all();
+        assert!(!ngram_store.model().is_empty());
+
+        let typo_profile = PersonalTypoProfile::shared(&journal);
+        typo_profile
+            .record_accepted(&[("gan".to_owned(), "guan".to_owned())])
+            .unwrap();
+        typo_profile.record_suppression("zhogn").unwrap();
+        typo_profile
+            .record_shuangpin(
+                ShuangpinProfileKind::Xiaohe,
+                &[(*b"gf", *b"gr")],
+                ShuangpinTypoOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(typo_profile.accepted("gan", "guan"), 1);
+        assert!(typo_profile.suppressed("zhogn"));
+        assert!(typo_profile.has_shuangpin_counts());
+
+        sql(
+            &journal,
+            "INSERT INTO candidate_selection_state VALUES('ni''hao','ni''hao','拟好',3);
+             INSERT INTO fixed_candidate_positions VALUES('nine-key:64:','ni','你',1);
+             INSERT INTO pick_transitions VALUES('ni','你','hao','好',2,100);
+             INSERT INTO pinned_candidates VALUES('ni''hao','拟好',100);
+             INSERT INTO quick_phrase_slots VALUES('rq',2);",
+        );
+
+        reset_auto_learned_data(&paths).unwrap();
+
+        assert!(ngram_store.model().is_empty());
+        assert_eq!(typo_profile.accepted("gan", "guan"), 0);
+        assert!(!typo_profile.suppressed("zhogn"));
+        assert!(!typo_profile.has_shuangpin_counts());
+
+        for table in [
+            "candidate_selection_state",
+            "fixed_candidate_positions",
+            "pick_transitions",
+            "pinyin_typo_counts",
+            "pinyin_autocorrect_suppressions",
+            "shuangpin_typo_counts",
+            "shuangpin_autocorrect_suppressions",
+            "pinned_candidates",
+            "personal_bigram",
+            "personal_trigram",
+            "quick_phrase_slots",
+        ] {
+            assert_eq!(
+                weight(&journal, &format!("SELECT count(*) FROM {table}")),
+                Some(0),
+                "{table}"
+            );
+        }
+
+        assert_eq!(
+            weight(
+                &journal,
+                "SELECT count(*) FROM user_dictionary_operations WHERE user_inserted=0",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            weight(
+                &journal,
+                "SELECT count(*) FROM user_dictionary_operations WHERE user_inserted=1",
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            weight(
+                &journal,
+                "SELECT CAST(backup_timestamp * 10 AS INTEGER) FROM user_dictionary_operations WHERE value='法言输入'",
+            ),
+            Some(17_000_000_035)
+        );
+        assert_eq!(
+            weight(
+                &journal,
+                "SELECT count(*) FROM responsay_hotwords WHERE term='法言热词' AND manual=1 AND deleted=0",
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            weight(
+                &journal,
+                "SELECT count(*) FROM responsay_hotwords WHERE manual=0",
+            ),
+            Some(0)
+        );
+
+        assert_eq!(
+            weight(
+                &paths.dictionary(assets::MAIN_DICTIONARY),
+                "SELECT weight FROM tbl_2_n WHERE value='拟好'",
+            ),
+            Some(100)
+        );
+        assert_eq!(
+            weight(
+                &paths.dictionary(assets::MAIN_DICTIONARY),
+                "SELECT count(*) FROM tbl_2_n WHERE value='自造'",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            weight(
+                &paths.dictionary(assets::MAIN_DICTIONARY),
+                "SELECT weight FROM tbl_4_f WHERE key='fa''yan''shu''ru' AND value='法言输入'",
+            ),
+            Some(1000)
+        );
+        assert_eq!(
+            weight(
+                &paths.dictionary(assets::ENGLISH_DICTIONARY),
+                "SELECT count(*) FROM english_words WHERE word='autoword'",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            weight(
+                &paths.dictionary(assets::ENGLISH_DICTIONARY),
+                "SELECT weight FROM english_words WHERE word='responsay' AND display='Responsay'",
+            ),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn reset_auto_learned_journal_before_generation_is_ready_leaves_clean_generation_for_prepare() {
+        use crate::prepare_runtime_paths;
+        use crate::types::PersonalDictionaryKind;
+        use crate::user_dictionary::journal;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = paths(root.path());
+        sql(
+            &base.resource(assets::MAIN_DICTIONARY),
+            "CREATE TABLE tbl_2_z(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+             CREATE TABLE tbl_4_f(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+             CREATE TABLE wubi86(key TEXT,value TEXT,weight INTEGER);",
+        );
+        sql(
+            &base.resource(assets::ENGLISH_DICTIONARY),
+            "CREATE TABLE english_words(word TEXT,display TEXT,weight INTEGER);
+             INSERT INTO english_words VALUES('hello','hello',100);",
+        );
+        let journal = base.user(assets::USER_JOURNAL);
+        journal::record_learned_insert(
+            &journal,
+            PersonalDictionaryKind::Pinyin,
+            "zi'zao",
+            "自造",
+            300,
+            "",
+            false,
+        )
+        .unwrap();
+        journal::record_learned_insert(
+            &journal,
+            PersonalDictionaryKind::Pinyin,
+            "fa'yan'shu'ru",
+            "法言输入",
+            1000,
+            "",
+            true,
+        )
+        .unwrap();
+
+        reset_auto_learned_journal(&base.user_data).unwrap();
+
+        let prepared =
+            prepare_runtime_paths(&base.resources, &base.user_data, &base.cache, "gen-1").unwrap();
+        assert_eq!(
+            weight(
+                &prepared.dictionary(assets::MAIN_DICTIONARY),
+                "SELECT count(*) FROM tbl_2_z WHERE value='自造'",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            weight(
+                &prepared.dictionary(assets::MAIN_DICTIONARY),
+                "SELECT weight FROM tbl_4_f WHERE key='fa''yan''shu''ru' AND value='法言输入'",
+            ),
+            Some(1000)
+        );
     }
 }

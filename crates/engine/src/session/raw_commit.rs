@@ -6,7 +6,7 @@ use crate::assets;
 use crate::diagnostics;
 use crate::pinyin::segment::is_complete_pinyin_input;
 use crate::types::{Command, KeyResult, LocalInputMode};
-use crate::user_dictionary::removal::learn_entered_english_word;
+use crate::user_dictionary::removal::learn_entered_english_word_with;
 
 impl Session {
     /// 原样上屏、不学词。专用英文里组字自己的原样上屏会学这个词，所以那里取预编辑原文、结束组字，自己交出上屏（bridge.cpp:1320-1331）；上屏的就是预编辑原文，本地模式的入口字母也在内。其余情况就是不带学词策略的 `CommitRaw`。
@@ -59,11 +59,12 @@ impl Session {
                 };
                 let paths = &self.input.paths;
                 // 上屏已经发生；学不进去的词在结果旁边报告，不撤回上屏。
-                if learn_entered_english_word(
+                if learn_entered_english_word_with(
                     &paths.dictionary(assets::ENGLISH_DICTIONARY),
                     &paths.user(assets::USER_JOURNAL),
                     &word,
                     ENTERED_ENGLISH_WORD_WEIGHT,
+                    self.input.mark_learned_words_user_inserted,
                 )
                 .is_err()
                 {

@@ -40,7 +40,7 @@ use crate::types::{
     ShuangpinHelpcodeModes, WordItem, WubiInputOptions,
 };
 use crate::user_dictionary::ngram_store::PersonalNgramStore;
-use crate::user_dictionary::removal::learn_entered_english_word;
+use crate::user_dictionary::removal::learn_entered_english_word_with;
 use crate::user_dictionary::typo_profile::PersonalTypoProfile;
 use crate::zhuyin;
 use crate::zhuyin::scheme::ZhuyinKey;
@@ -90,6 +90,7 @@ pub(super) struct InputSession {
     pub chinese_punctuation_enabled: bool,
     pub punctuation_lock: i32,
     pub learning_enabled: bool,
+    pub mark_learned_words_user_inserted: bool,
     /// 回车上屏英文拼写时是否学进英文词库（`SessionOptions::learn_english_on_enter`）。
     pub learn_english_on_enter: bool,
     pub personal_context_enabled: bool,
@@ -223,6 +224,7 @@ impl InputSession {
             chinese_punctuation_enabled: true,
             punctuation_lock: 0,
             learning_enabled: true,
+            mark_learned_words_user_inserted: options.mark_learned_words_user_inserted,
             learn_english_on_enter: options.learn_english_on_enter,
             personal_context_enabled: true,
             punctuation: PunctuationPolicy::default(),
@@ -1702,6 +1704,23 @@ impl InputSession {
         }
     }
 
+    pub fn set_learning_enabled(&mut self, enabled: bool) {
+        self.learning_enabled = enabled;
+        self.learn_english_on_enter = enabled;
+        self.personal_context_enabled = enabled;
+        self.phrase_progress = CreatingWordProgress::default();
+        self.cantonese_progress = CantonesePhraseProgress::default();
+        self.jianpin_slash_chain.reset();
+        self.reset_commit_context();
+        if enabled
+            && self.has_composition()
+            && !self.dedicated_english
+            && self.local_mode == LocalInputMode::None
+        {
+            self.update_mixed_candidates();
+        }
+    }
+
     pub fn set_cloud_candidates_enabled(&mut self, enabled: bool) {
         if self.cloud_candidates_enabled == enabled {
             return;
@@ -2463,11 +2482,12 @@ impl InputSession {
         if self.learn_english_on_enter
             && self.dedicated_english
             && self.can_learn_english_words()
-            && learn_entered_english_word(
+            && learn_entered_english_word_with(
                 &self.paths.dictionary(assets::ENGLISH_DICTIONARY),
                 self.journal_path(),
                 self.local_mode.without_entry_marker(&raw),
                 ENTERED_ENGLISH_WORD_WEIGHT,
+                self.mark_learned_words_user_inserted,
             )
             .is_err()
         {

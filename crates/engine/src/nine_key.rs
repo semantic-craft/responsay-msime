@@ -383,6 +383,7 @@ type Path = Vec<String>;
 pub struct NineKeySession {
     paths: RuntimePaths,
     learning: bool,
+    mark_learned_words_user_inserted: bool,
     frequency: FrequencyAdjustmentOptions,
     fuzzy: FuzzyPinyinOptions,
     english_options: EnglishInputOptions,
@@ -522,6 +523,7 @@ impl NineKeySession {
         Self {
             paths: paths.clone(),
             learning,
+            mark_learned_words_user_inserted: true,
             frequency,
             fuzzy,
             english_options: english,
@@ -659,6 +661,27 @@ impl NineKeySession {
     /// 与 26 键的 `InputSession::set_personal_context_enabled` 一起设置：关掉后九键选中的词不再记进个人上下文模型。
     pub fn set_personal_context_enabled(&mut self, enabled: bool) {
         self.personal_context = enabled;
+    }
+
+    pub(crate) fn set_mark_learned_words_user_inserted(&mut self, enabled: bool) {
+        self.mark_learned_words_user_inserted = enabled;
+    }
+
+    pub fn learning_enabled(&self) -> bool {
+        self.learning
+    }
+
+    pub fn personal_context_enabled(&self) -> bool {
+        self.personal_context
+    }
+
+    pub fn set_learning_enabled(&mut self, enabled: bool) {
+        self.learning = enabled;
+        self.personal_context = enabled;
+        self.reset_phrase();
+        if self.active() {
+            self.refresh();
+        }
     }
 
     /// 键盘模型读的上屏上下文，与 26 键的 `QuanpinDictionary::set_rescoring_context` 一样只记下最后 `CONTEXT_CHARACTERS` 个字，不重排已有的候选。
@@ -1054,7 +1077,11 @@ impl NineKeySession {
         match self
             .dictionary
             .get_or_insert_with(|| open_dictionary(&self.paths, options))
-            .create_word_from_canonical_pinyin(&pinyin, &word)
+            .create_word_from_canonical_pinyin_with(
+                &pinyin,
+                &word,
+                self.mark_learned_words_user_inserted,
+            )
         {
             Ok(()) => (None, Some(word)),
             Err(EngineError::InvalidArgument(_)) => (None, None),

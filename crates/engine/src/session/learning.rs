@@ -1759,4 +1759,131 @@ mod tests {
             50
         );
     }
+
+    #[test]
+    fn live_learning_toggle_suppresses_all_writes_and_breaks_cross_boundary_chains() {
+        let fixture = Fixture::new(
+            &[
+                ("ni", "甲", 300),
+                ("ni", "乙", 200),
+                ("hao", "子", 300),
+                ("hao", "丑", 200),
+                ("shan", "山", 200),
+                ("shui", "水", 200),
+                ("shan'shan", "闪闪", 10),
+                ("zhong'guo'ren", "中国人", 500),
+            ],
+            &[],
+        );
+        let mut session = fixture.session(|o| {
+            o.learning = true;
+            o.personal_context = true;
+            o.learn_english_on_enter = true;
+            o.mark_learned_words_user_inserted = false;
+            o.autocorrect_types =
+                autocorrect_type::TRANSPOSITION | autocorrect_type::NEIGHBOR;
+            o.frequency = frequency(FrequencyAdjustmentMode::Pin, 1, 1);
+        });
+        assert!(session.learning_enabled());
+
+        session.set_learning_enabled(false);
+        assert!(!session.learning_enabled());
+
+        type_text(&mut session, "ni");
+        select_word(&mut session, "乙");
+        type_text(&mut session, "hao");
+        select_word(&mut session, "丑");
+
+        type_text(&mut session, "shanshui");
+        select_word(&mut session, "山");
+        select_word(&mut session, "水");
+
+        type_text(&mut session, "zhognuoren");
+        if words(&session).iter().any(|w| w == "中国人") {
+            select_word(&mut session, "中国人");
+        } else {
+            cancel(&mut session);
+        }
+        type_text(&mut session, "zhognuoren");
+        session.command(crate::types::Command::CommitRaw);
+
+        session.set_nine_key_enabled(true);
+        type_text(&mut session, "64");
+        select_word(&mut session, "乙");
+        session.set_nine_key_enabled(false);
+
+        session.set_dedicated_english(true);
+        type_text(&mut session, "RestrictedSecret");
+        assert_eq!(
+            session.command(crate::types::Command::CommitRaw).commit.as_deref(),
+            Some("RestrictedSecret")
+        );
+        session.set_dedicated_english(false);
+
+        assert!(!fixture.journal().exists());
+        assert_eq!(
+            fixture.query(
+                &fixture.paths.dictionary(assets::ENGLISH_DICTIONARY),
+                "SELECT count(*) FROM english_words WHERE word='restrictedsecret'",
+            ),
+            0
+        );
+
+        type_text(&mut session, "ni");
+        select_word(&mut session, "甲");
+        session.set_learning_enabled(false);
+        type_text(&mut session, "hao");
+        select_word(&mut session, "丑");
+
+        session.set_learning_enabled(true);
+        assert!(session.learning_enabled());
+
+        type_text(&mut session, "shan");
+        select_word(&mut session, "山");
+        assert_eq!(
+            fixture.journal_count(
+                "SELECT count(*) FROM personal_bigram WHERE previous IN ('甲','丑') AND word='山'",
+            ),
+            0
+        );
+        assert_eq!(
+            fixture.journal_count(
+                "SELECT count(*) FROM personal_bigram WHERE previous=char(1) AND word='山'",
+            ),
+            1
+        );
+        assert_eq!(
+            fixture.journal_count("SELECT count(*) FROM pick_transitions"),
+            0
+        );
+
+        type_text(&mut session, "shanshui");
+        select_word(&mut session, "山");
+        select_word(&mut session, "水");
+        assert_eq!(
+            fixture.journal_count(
+                "SELECT count(*) FROM user_dictionary_operations WHERE key='shan''shui' AND value='山水' AND user_inserted=0",
+            ),
+            1
+        );
+        assert_eq!(
+            fixture.journal_count(
+                "SELECT count(*) FROM user_dictionary_operations WHERE user_inserted=1",
+            ),
+            0
+        );
+
+        session.set_dedicated_english(true);
+        type_text(&mut session, "LearnedPublic");
+        assert_eq!(
+            session.command(crate::types::Command::CommitRaw).commit.as_deref(),
+            Some("LearnedPublic")
+        );
+        assert_eq!(
+            fixture.journal_count(
+                "SELECT count(*) FROM user_dictionary_operations WHERE dictionary='english' AND key='learnedpublic' AND user_inserted=0",
+            ),
+            1
+        );
+    }
 }

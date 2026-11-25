@@ -122,7 +122,10 @@ pub use user_dictionary::personal::{
     PersonalDictionaryPage,
 };
 pub use user_dictionary::replay::{replay as replay_user_dictionary, ReplayResult};
-pub use user_dictionary::reset::{reset_learned_data, reset_learned_data_for};
+pub use user_dictionary::reset::{
+    reset_auto_learned_data, reset_auto_learned_data_for, reset_auto_learned_journal,
+    reset_learned_data, reset_learned_data_for,
+};
 pub use user_dictionary::state::{
     dictionary_state_revision, stage_dictionary_state, stream_dictionary_state,
     DictionaryStateRecord, DEFAULT_MAXIMUM_RECORDS,

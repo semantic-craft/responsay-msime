@@ -202,9 +202,14 @@ impl QuanpinEngine {
         self.dictionary.best_weights(keys)
     }
 
-    pub fn create_word_from_canonical_pinyin(&mut self, pinyin: &str, word: &str) -> Result<()> {
+    pub(crate) fn create_word_from_canonical_pinyin_with(
+        &mut self,
+        pinyin: &str,
+        word: &str,
+        user_inserted: bool,
+    ) -> Result<()> {
         self.dictionary
-            .create_word_from_canonical_pinyin(pinyin, word)
+            .create_word_from_canonical_pinyin_with(pinyin, word, user_inserted)
     }
 
     pub fn conversion_rows(&mut self, span: &[String], limit: usize) -> Vec<DictRow> {

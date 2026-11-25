@@ -475,6 +475,7 @@ pub fn session_options(options: &EngineOptions) -> Result<SessionOptions> {
             enumeration_comma_slash: options.enumeration_comma_slash,
         },
         learning: options.learning,
+        mark_learned_words_user_inserted: true,
         learn_english_on_enter: options.learn_english_on_enter,
         // 产品的回车学词策略（bridge.cpp:1332-1359）：专用英文之外，临时模式里原样上屏的字母和拼不成音节的拼音也学成英文词。总开关仍是 `learn_english_on_enter`。
         learn_typed_spellings_on_enter: true,

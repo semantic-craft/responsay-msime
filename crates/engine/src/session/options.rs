@@ -73,6 +73,7 @@ pub struct SessionOptions {
     /// 中文标点下引号键和方头括号键出哪一组字，缺省是弯引号、实心括号。
     pub punctuation_marks: PunctuationMarks,
     pub learning: bool,
+    pub mark_learned_words_user_inserted: bool,
     /// 回车（`Command::CommitRaw`）原样上屏时学英文词的总开关，缺省开。只开它时只学专用英文里打的词（参照实现的会话行为）；还要学别的原样上屏，再开 `learn_typed_spellings_on_enter`。方案集合不要求 `msime-english.db`（`SchemeSet::requires_english_dictionary`）、代次里也没有它时什么也不学。
     pub learn_english_on_enter: bool,
     /// 回车原样上屏时，专用英文之外也把上屏的字母学成英文词（msime 产品的策略，Windows `input.enter_learns_english_word`）：临时模式里原样上屏的字母（去掉入口字母；临时日文的词前面加 `R`），以及全拼、双拼里拼不成完整音节的拼音。九宫格组字（九键是数字，14 键是首选）、整句改字、生成文本的本地模式（计算、指令、名单）和网址都不学。要 `learn_english_on_enter` 也开着才生效。学不进去时上屏照旧，结果带 `ENGLISH_WORD_NOT_LEARNED` 诊断。缺省关：引擎库的回车只在专用英文里学词，msime 自己的宿主打开它。`Command::CommitRawWithoutLearning` 不受它影响。
@@ -160,6 +161,7 @@ impl SessionOptions {
             punctuation_lock: 0,
             punctuation_marks: PunctuationMarks::default(),
             learning: true,
+            mark_learned_words_user_inserted: true,
             learn_english_on_enter: true,
             learn_typed_spellings_on_enter: false,
             sentence_alternatives: false,

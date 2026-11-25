@@ -504,6 +504,22 @@ impl PersonalTypoProfile {
         profile
     }
 
+    pub(crate) fn invalidate_journal(user_db: &Path) {
+        let existing = PROFILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(user_db)
+            .and_then(Weak::upgrade);
+        if let Some(profile) = existing {
+            let mut loaded = profile
+                .loaded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *loaded = None;
+            profile.adopt(PinyinTypoState::default());
+        }
+    }
+
     fn stamp(&self) -> (FileStamp, FileStamp) {
         (file_stamp(&self.path), file_stamp(&self.wal))
     }

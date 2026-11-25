@@ -114,6 +114,7 @@ impl Session {
         nine_key.set_rescoring_context(&options.rescoring_context);
         // 九键选中的词记进同一个个人上下文模型，开关与 26 键相同（#6185）。
         nine_key.set_personal_context_enabled(options.personal_context);
+        nine_key.set_mark_learned_words_user_inserted(options.mark_learned_words_user_inserted);
         let journal = options.paths.user(crate::assets::USER_JOURNAL);
         Ok(Session {
             input,
@@ -813,6 +814,26 @@ impl Session {
         self.prediction.clear();
         self.input.set_personal_context_enabled(enabled);
         self.nine_key.set_personal_context_enabled(enabled);
+    }
+
+    pub fn learning_enabled(&self) -> bool {
+        self.input.learning_enabled
+    }
+
+    /// Updates session learning, personal context, and Enter English learning in place without reopening the session. Any transient commit chain or multi-segment phrase progress is cleared on transition so words never chain across a privacy boundary.
+    pub fn set_learning_enabled(&mut self, enabled: bool) {
+        if self.input.learning_enabled == enabled
+            && self.input.personal_context_enabled == enabled
+            && self.input.learn_english_on_enter == enabled
+            && self.nine_key.learning_enabled() == enabled
+            && self.nine_key.personal_context_enabled() == enabled
+        {
+            return;
+        }
+        self.candidates_may_change();
+        self.prediction.clear();
+        self.input.set_learning_enabled(enabled);
+        self.nine_key.set_learning_enabled(enabled);
     }
 
     /// 当前组字是否预留云候选席位；运行时在修改前据此判断候选身份是否会变化。

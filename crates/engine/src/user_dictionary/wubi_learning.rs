@@ -52,7 +52,17 @@ fn learned_kinds(profile: WubiProfileKind) -> &'static [PersonalDictionaryKind] 
 }
 
 /// 只补缺失词，不覆盖已有编码、权重或删除决定。`profile` 是会话当前的五笔版本，决定学不学新世纪（[`learned_kinds`]）。返回是否改变了工作词库。
+#[cfg(test)]
 pub(crate) fn learn(paths: &RuntimePaths, word: &str, profile: WubiProfileKind) -> Result<bool> {
+    learn_with(paths, word, profile, true)
+}
+
+pub(crate) fn learn_with(
+    paths: &RuntimePaths,
+    word: &str,
+    profile: WubiProfileKind,
+    user_inserted: bool,
+) -> Result<bool> {
     if word.chars().count() < 2 || !word.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
         return Ok(false);
     }
@@ -81,6 +91,11 @@ pub(crate) fn learn(paths: &RuntimePaths, word: &str, profile: WubiProfileKind) 
     attach(&connection, &journal, "wubi_phrase_journal")?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut changed = false;
+    let sql = if user_inserted {
+        "INSERT INTO wubi_phrase_journal.user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at) VALUES(?1,?2,?3,'upsert',?4,'',1,min(max(unixepoch(),COALESCE((SELECT reset_floor FROM wubi_phrase_journal.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='upsert',weight=excluded.weight,user_inserted=1,updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)"
+    } else {
+        "INSERT INTO wubi_phrase_journal.user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at) VALUES(?1,?2,?3,'upsert',?4,'',0,min(max(unixepoch(),COALESCE((SELECT reset_floor FROM wubi_phrase_journal.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='upsert',weight=excluded.weight,user_inserted=CASE WHEN operation='delete' THEN 0 ELSE user_inserted END,updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)"
+    };
     for (kind, table, code) in entries {
         let existing: bool = transaction.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE value=?1)"),
@@ -107,10 +122,7 @@ pub(crate) fn learn(paths: &RuntimePaths, word: &str, profile: WubiProfileKind) 
             &format!("INSERT INTO {table}(key,value,weight) VALUES(?1,?2,?3)"),
             params![code, word, weight],
         )?;
-        transaction.execute(
-            "INSERT INTO wubi_phrase_journal.user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at) VALUES(?1,?2,?3,'upsert',?4,'',1,min(max(unixepoch(),COALESCE((SELECT reset_floor FROM wubi_phrase_journal.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='upsert',weight=excluded.weight,user_inserted=1,updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)",
-            params![kind.journal_name(), code, word, weight],
-        )?;
+        transaction.execute(sql, params![kind.journal_name(), code, word, weight])?;
         changed = true;
     }
     transaction.commit()?;

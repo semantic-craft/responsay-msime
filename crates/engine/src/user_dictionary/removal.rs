@@ -5,7 +5,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use super::journal::{
-    ensure_user_database, open_dictionary_for_writing, record_user_insert, tombstone_sql,
+    ensure_user_database, open_dictionary_for_writing, record_learned_insert, tombstone_sql,
     MISSING_ROW, UNSTORABLE_ENTRY,
 };
 use super::ngram_store::{delete_personal_ngram_word, flush_journal, forget_journal_rows};
@@ -93,11 +93,22 @@ pub fn delete_dictionary_candidate(
 }
 
 /// 把回车原样上屏的英文词（1 到 64 个 ASCII 字母）按 `weight` 学进英文词库，并在日志里记一条用户插入；已经认识的词什么也不做、照样算成功（J:1212-1246）。全小写的输入在词库已有这个词的另一种大小写写法（ETF、USB、Figma）时也算认识：小写多半只是没按 Shift，另学一份小写会让候选里同时出现 `ETF` 和 `etf`。
+#[cfg(test)]
 pub fn learn_entered_english_word(
     english_db: &Path,
     user_db: &Path,
     display: &str,
     weight: i64,
+) -> Result<()> {
+    learn_entered_english_word_with(english_db, user_db, display, weight, true)
+}
+
+pub(crate) fn learn_entered_english_word_with(
+    english_db: &Path,
+    user_db: &Path,
+    display: &str,
+    weight: i64,
+    user_inserted: bool,
 ) -> Result<()> {
     if display.is_empty()
         || display.len() > MAX_LEARNED_ENGLISH_WORD_LENGTH
@@ -126,13 +137,14 @@ pub fn learn_entered_english_word(
     if inserted == 0 {
         return Ok(());
     }
-    if let Err(error) = record_user_insert(
+    if let Err(error) = record_learned_insert(
         user_db,
         PersonalDictionaryKind::English,
         &word,
         display,
         weight,
         display,
+        user_inserted,
     ) {
         // Do not leave an entry that cannot survive a dictionary upgrade. The journal error is what the caller reports; a failed clean-up leaves the word usable until the next upgrade drops it.
         let _ = connection.execute(

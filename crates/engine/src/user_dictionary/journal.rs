@@ -97,6 +97,8 @@ pub(crate) const UPSERT_JOURNAL_SQL: &str = "INSERT INTO user_dictionary_operati
 /// J:547-559。用户词也保留原身份的逻辑时间。
 const USER_INSERT_SQL: &str = "INSERT INTO user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at) VALUES(?1,?2,?3,'upsert',?4,?5,1,min(max(unixepoch(),COALESCE((SELECT reset_floor FROM main.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='upsert',weight=excluded.weight, display=excluded.display,user_inserted=1,updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)";
 
+const LEARNED_INSERT_SQL: &str = "INSERT INTO user_dictionary_operations(dictionary,key,value,operation,weight,display,user_inserted,updated_at) VALUES(?1,?2,?3,'upsert',?4,?5,0,min(max(unixepoch(),COALESCE((SELECT reset_floor FROM main.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='upsert',weight=excluded.weight, display=excluded.display,user_inserted=CASE WHEN operation='delete' THEN 0 ELSE user_inserted END,updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)";
+
 /// J:583-596。`schema` 为内部固定别名；删词保留用户来源，并推进该身份的逻辑时间。
 pub(crate) fn tombstone_sql(schema: &str) -> String {
     format!("INSERT INTO {schema}.user_dictionary_operations(dictionary,key,value,operation,updated_at) VALUES(?1,?2,?3,'delete',min(max(unixepoch(),COALESCE((SELECT reset_floor FROM {schema}.learning_sync_clock WHERE singleton=1),0)+1),1099511627776)) ON CONFLICT(dictionary,key,value) DO UPDATE SET operation='delete',weight=0,display='', updated_at=min(max(excluded.updated_at,min(updated_at,1099511627776)+1),1099511627776)")
@@ -632,8 +634,25 @@ pub fn record_user_insert(
     weight: i64,
     display: &str,
 ) -> Result<()> {
+    record_learned_insert(user_db, kind, key, value, weight, display, true)
+}
+
+pub(crate) fn record_learned_insert(
+    user_db: &Path,
+    kind: PersonalDictionaryKind,
+    key: &str,
+    value: &str,
+    weight: i64,
+    display: &str,
+    user_inserted: bool,
+) -> Result<()> {
     let journal = open_journal(user_db)?;
-    journal.prepare_cached(USER_INSERT_SQL)?.execute(params![
+    let sql = if user_inserted {
+        USER_INSERT_SQL
+    } else {
+        LEARNED_INSERT_SQL
+    };
+    journal.prepare_cached(sql)?.execute(params![
         kind.journal_name(),
         key,
         value,
@@ -649,6 +668,31 @@ fn existing_journal(user_db: &Path) -> Option<JournalConnection> {
         return None;
     }
     open_journal(user_db).ok()
+}
+
+pub(crate) fn has_active_upsert(
+    user_db: &Path,
+    kind: PersonalDictionaryKind,
+    key: &str,
+    value: &str,
+) -> bool {
+    let Some(journal) = existing_journal(user_db) else {
+        return false;
+    };
+    journal
+        .prepare_cached(
+            "SELECT 1 FROM user_dictionary_operations WHERE dictionary=?1 AND key=?2 AND value=?3 AND operation='upsert' LIMIT 1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_row(params![kind.journal_name(), key, value], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+        })
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Does not look at `operation` (J:598-609). A missing journal answers false without creating it.
