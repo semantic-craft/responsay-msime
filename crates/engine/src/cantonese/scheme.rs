@@ -500,10 +500,10 @@ impl CantoneseScheme {
         if shuangpin {
             let mut offset = 0;
             for chunk in self.input.split('\'') {
-                for code in chunk.as_bytes().chunks_exact(2) {
+                for &code in chunk.as_bytes().as_chunks::<2>().0 {
                     offset += 2;
                     positions.push(SentencePosition {
-                        readings: shuangpin::decode(&self.inventory, [code[0], code[1]]),
+                        readings: shuangpin::decode(&self.inventory, code),
                         end: offset,
                     });
                 }

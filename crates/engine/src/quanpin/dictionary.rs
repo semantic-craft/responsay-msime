@@ -40,12 +40,14 @@ use crate::pinyin::segment::{
     cut_pinyin_by_mode, is_complete_pinyin_input, join_segments, split_segments, CutMode,
 };
 use crate::pinyin::syllables::{
-    has_only_complete_pinyin_segments, is_intact, is_prefix, normalize_umlaut_aliases,
-    sparse_pinyin_fallback_segments,
+    canonical_intact_piece, has_only_complete_pinyin_segments, is_intact, is_prefix,
+    normalize_umlaut_aliases, sparse_pinyin_fallback_segments, MAX_SYLLABLE_LENGTH,
 };
+use crate::pinyin::typos::keys_adjacent;
 use crate::shared_string::SharedString;
 use crate::text::{count_han_chars, last_characters};
 use crate::time::Instant;
+use crate::touch::{touch_signature, touch_slice, KeyGeometry, KeyTouch, TouchTuning};
 use crate::types::{
     autocorrect_type, CandidateSource, FirstPageRows, FuzzyPinyinOptions, PersonalDictionaryKind,
     SentenceAssociationOptions, WordItem,
@@ -59,11 +61,16 @@ use super::series::{
     append_unique_words, defer_pooled_sentences, fold_reading, has_corrected_cut,
     lead_literal_abbreviation_phrases, mark_autocorrect_candidates, merge_alternative_rows,
     merge_alternative_segmentations, merge_series_by_coverage, resolve_series_query,
-    series_cache_key, SeriesResolution, ALTERNATIVE_SEGMENTATION_CANDIDATE_LIMIT,
-    AUTOCORRECT_CUT_KBEST, LONGER_PHRASE_EXTRA_SYLLABLES, LONGER_PHRASE_LIMIT,
-    MAX_SYLLABLES_FOR_MULTIPLE_SEGMENTATIONS,
+    resolve_series_query_with_touch, series_cache_key, SeriesResolution,
+    ALTERNATIVE_SEGMENTATION_CANDIDATE_LIMIT, AUTOCORRECT_CUT_KBEST, LONGER_PHRASE_EXTRA_SYLLABLES,
+    LONGER_PHRASE_LIMIT, MAX_SYLLABLES_FOR_MULTIPLE_SEGMENTATIONS,
 };
-use super::typo_edges::{collect_typo_edges, EditWindowCache, EDIT_WINDOW_CACHE_CAPACITY};
+use super::typo_edges::{
+    collect_priced_quanpin_typo_edges, collect_typo_edges, priced_quanpin_variants,
+    quanpin_touch_leads_correction, quanpin_touch_supports_correction, segments_align_with_raw,
+    EditWindowCache, PricedQuanpinTypo, EDIT_WINDOW_CACHE_CAPACITY, QUANPIN_TYPO_PENALTY_SCALE,
+    TYPO_ROWS_PER_KEY,
+};
 
 #[cfg(test)]
 mod marking_buffer_tests;
@@ -98,6 +105,8 @@ const ALTERNATIVE_SEGMENTATION_SEEN_CAPACITY: usize =
     AUTOCORRECT_CUT_KBEST - 1 + SYLLABLE_GRAPH_PATH_LIMIT;
 /// 纠错整句扣掉罚分后每处纠错比字面整句高出这么多，就坐第一条整句后面（第二位），不再排到整句块之后。胜过得更多的（`typo_lead_margin`，50）坐首位。整句块有好几条读法，块后的纠错句在手机候选栏上常常看不到：xianziawodayoduanhua 的「现在我打一段话」高出字面整句很多，却排在三条不成句的读法后面。罚分折扣 0.25（`QUANPIN_TYPO_PENALTY_SCALE`）下，10396 条原句里出纠错整句的 702 条、每处高出的中位数 4.4，超过 20 的 38 条，其中字面整句本来就是原句的只有 2 条（坐第二位不动首选，只把第二条字面读法往后挪一格）；1812 条合法拼音打错集里超过 20 的 503 条。
 pub const TYPO_SECOND_SEAT_MARGIN: f64 = 20.0;
+const QUANPIN_TOUCH_LEAD_MARGIN: f64 = 12.0 * QUANPIN_TYPO_PENALTY_SCALE;
+const TWO_SYLLABLE_TOUCH_PENALTY_CAP: f64 = 12.0;
 /// The masks whose lists depend on the typo profile and carry typo sentences.
 const TYPO_EDGE_TYPES: u32 = autocorrect_type::TRANSPOSITION
     | autocorrect_type::NEIGHBOR
@@ -283,6 +292,11 @@ pub struct QuanpinDictionary {
     /// Every non-primary correction cut, joined; marking compares against them on every query, cached or not.
     alternative_segmentations: Vec<String>,
     current_autocorrect_types: u32,
+    key_touches: Vec<Option<KeyTouch>>,
+    touch_input: String,
+    key_geometry: Option<Arc<KeyGeometry>>,
+    touch_tuning: TouchTuning,
+    lead_allowed: bool,
 }
 
 impl QuanpinDictionary {
@@ -343,6 +357,11 @@ impl QuanpinDictionary {
             pinyin_segmentation: String::new(),
             alternative_segmentations: Vec::new(),
             current_autocorrect_types: 0,
+            key_touches: Vec::new(),
+            touch_input: String::new(),
+            key_geometry: None,
+            touch_tuning: TouchTuning::default(),
+            lead_allowed: false,
         };
         dictionary.reset_cache_if_database_changed();
         dictionary
@@ -589,11 +608,12 @@ impl QuanpinDictionary {
         candidates.splice(first_limited..first_limited, expanded.iter().cloned());
         self.cache.insert(code.to_string(), expanded.into());
         // 按参考规则写入不带 `C:` 的槽（QD:554）：单字母不纠错。根据调用方查询重算键，避免第二次光标前缀查询把整段输入的展开列表写入自己的槽。
+        let touch_sig = self.touch_signature(raw);
         let cache_key =
             self.project_resolution(raw, segmentation, autocorrect_types, |resolution| {
                 series_cache_key(raw, &resolution.segmentation, autocorrect_types)
             });
-        let key = self.series_slot(&cache_key);
+        let key = self.series_slot_for(&cache_key, touch_sig.as_deref());
         self.series_cache.insert(key, candidates.clone());
         true
     }
@@ -696,6 +716,7 @@ impl QuanpinDictionary {
             return false;
         }
         // 按查询原规则重算键，使候选写入下次刷新读取的槽。
+        let touch_sig = self.touch_signature(raw);
         let cache_key =
             self.project_resolution(raw, segmentation, autocorrect_types, |resolution| {
                 match resolution {
@@ -703,7 +724,7 @@ impl QuanpinDictionary {
                     Cow::Owned(resolution) => resolution.cache_key,
                 }
             });
-        let key = self.series_slot(&cache_key);
+        let key = self.series_slot_for(&cache_key, touch_sig.as_deref());
         if let Some(list) = self.series_cache.get_mut(&key) {
             return replace_cached_online_candidate_batch(list, raw, words, source);
         }
@@ -881,13 +902,83 @@ impl QuanpinDictionary {
         }
     }
 
+    pub fn set_key_touches(
+        &mut self,
+        touches: &[Option<KeyTouch>],
+        input: &str,
+        geometry: Option<&Arc<KeyGeometry>>,
+        tuning: TouchTuning,
+        lead_allowed: bool,
+    ) {
+        if self.touch_tuning != tuning {
+            self.touch_tuning = tuning;
+            self.series_cache.clear();
+            self.sentence_decode_cache.clear();
+            self.beam_prefixes.clear();
+            self.personal_scored_keys.clear();
+            self.resolution_cache.clear();
+        }
+        self.clear_key_touches();
+        let Some(geometry) = geometry.filter(|_| {
+            !touches.is_empty()
+                && touches.len() == input.len()
+                && touches.iter().any(Option::is_some)
+        }) else {
+            return;
+        };
+        self.key_touches.extend_from_slice(touches);
+        self.touch_input.push_str(input);
+        self.key_geometry = Some(Arc::clone(geometry));
+        self.lead_allowed = lead_allowed;
+    }
+
+    pub fn clear_key_touches(&mut self) {
+        self.key_touches.clear();
+        self.touch_input.clear();
+        self.key_geometry = None;
+        self.lead_allowed = false;
+    }
+
+    fn touch_signature(&self, touched: &str) -> Option<String> {
+        touch_signature(
+            &self.key_touches,
+            &self.touch_input,
+            touched,
+            self.key_geometry.as_deref(),
+            self.lead_allowed,
+        )
+    }
+
+    fn touched_slice<'a>(
+        &'a self,
+        text: &str,
+    ) -> Option<(&'a [Option<KeyTouch>], &'a KeyGeometry)> {
+        let geometry = self.key_geometry.as_deref()?;
+        let slice = touch_slice(&self.key_touches, &self.touch_input, text)?;
+        slice
+            .iter()
+            .any(Option::is_some)
+            .then_some((slice, geometry))
+    }
+
     /// The series cache slot of a resolution's key (overlays.md §1.6.2). The association switches decide which sentence rows a list carries, so they are always part of the slot. The reference bypassed the cache while a neural model ran, because its scores came from an asynchronous worker; scoring here is synchronous, so a reranked list is cached under the trimmed context it was scored with and a commit moves the next query to a fresh slot instead of clearing every list.
+    #[cfg(test)]
     fn series_slot(&self, cache_key: &str) -> String {
         series_slot_key(
             cache_key,
             &self.sentence_association,
             !self.rerankers.is_empty() || self.sentence_scorer.0.is_some(),
             &self.rescoring_context,
+        )
+    }
+
+    fn series_slot_for(&self, cache_key: &str, touch_sig: Option<&str>) -> String {
+        series_slot_key_with_touch(
+            cache_key,
+            &self.sentence_association,
+            !self.rerankers.is_empty() || self.sentence_scorer.0.is_some(),
+            &self.rescoring_context,
+            touch_sig,
         )
     }
 
@@ -973,23 +1064,44 @@ impl QuanpinDictionary {
                 self.personal_scored_keys.clear();
             }
         }
+        let touch_sig = self.touch_signature(raw);
         let mut segments = None;
         let segmentation_cache = &mut self.segmentation_cache;
         let association = self.sentence_association.clone();
         let has_rerankers = !self.rerankers.is_empty() || self.sentence_scorer.0.is_some();
         let context = &self.rescoring_context;
         let pinyin_segmentation = &mut self.pinyin_segmentation;
+        let key_touches = &self.key_touches;
+        let touch_input = &self.touch_input;
+        let key_geometry = self.key_geometry.as_deref();
+        let touch_tuning = self.touch_tuning;
         let (resolution_hash, (resolution, marking_alternatives, slot)) =
-            project_cached_resolution_with(
+            project_cached_resolution_with_touch(
                 &mut self.resolution_cache,
                 raw,
                 segmentation,
                 types,
+                touch_sig.as_deref(),
                 || {
                     let segments = segments.get_or_insert_with(|| {
                         resolve_cached_segments(segmentation_cache, raw, segmentation)
                     });
-                    resolve_series_query(raw, segments, types)
+                    if let Some((slice, geometry)) = key_geometry.and_then(|geom| {
+                        touch_slice(key_touches, touch_input, raw)
+                            .filter(|s| s.iter().any(Option::is_some))
+                            .map(|s| (s, geom))
+                    }) {
+                        resolve_series_query_with_touch(
+                            raw,
+                            segments,
+                            types,
+                            slice,
+                            Some(geometry),
+                            &touch_tuning,
+                        )
+                    } else {
+                        resolve_series_query(raw, segments, types)
+                    }
                 },
                 |resolution| {
                     // 热命中也发布本次标记；高成本读法仍算纠错。
@@ -1000,11 +1112,12 @@ impl QuanpinDictionary {
                         .chain(&resolution.costlier_corrected_cuts)
                         .map(|cut| join_segments(cut))
                         .collect();
-                    let slot = series_slot_key(
+                    let slot = series_slot_key_with_touch(
                         &resolution.cache_key,
                         &association,
                         has_rerankers,
                         context,
+                        touch_sig.as_deref(),
                     );
                     let owned = match resolution {
                         Cow::Borrowed(_) => None,
@@ -1089,6 +1202,13 @@ impl QuanpinDictionary {
                     result,
                 );
             }
+            self.rescue_two_syllable_touch_typo(
+                raw,
+                primary_segmentation,
+                &segments,
+                types,
+                &mut result,
+            );
         }
         let (cached, projected) = match cold {
             ColdRows::Transfer => {
@@ -1131,6 +1251,199 @@ impl QuanpinDictionary {
             self.remember_personal_scored_key(slot);
         }
         projected
+    }
+
+    fn rescue_two_syllable_touch_typo(
+        &mut self,
+        raw: &str,
+        primary_segmentation: &str,
+        segments: &[String],
+        types: u32,
+        result: &mut Vec<WordItem>,
+    ) {
+        if types & autocorrect_type::NEIGHBOR == 0
+            || segments.len() != 2
+            || !has_only_complete_pinyin_segments(segments)
+        {
+            return;
+        }
+        let Some((touches, geometry)) = self.touched_slice(raw) else {
+            return;
+        };
+        if !touches.iter().all(Option::is_some) || !segments_align_with_raw(raw, segments, touches)
+        {
+            return;
+        }
+        let tuning = self.touch_tuning;
+        let seg0_len = segments[0].len();
+        let raw_bytes = raw.as_bytes();
+        let mut candidate_keys: Vec<(String, f64)> = Vec::new();
+        for b in 0..raw_bytes.len() {
+            let pressed = raw_bytes[b].to_ascii_lowercase();
+            let Some(touch) = touches[b] else {
+                return;
+            };
+            let (seg_slice, local_idx, cur_canon) = if b < seg0_len {
+                (&raw_bytes[..seg0_len], b, segments[0].as_str())
+            } else {
+                (&raw_bytes[seg0_len..], b - seg0_len, segments[1].as_str())
+            };
+            if seg_slice.is_empty() || seg_slice.len() > MAX_SYLLABLE_LENGTH {
+                continue;
+            }
+            let mut buf = [0u8; MAX_SYLLABLE_LENGTH];
+            for (idx, &byte) in seg_slice.iter().enumerate() {
+                buf[idx] = byte.to_ascii_lowercase();
+            }
+            for c_j in b'a'..=b'z' {
+                if c_j == pressed {
+                    continue;
+                }
+                let Some(raw_pen) = geometry.penalty(pressed, touch, c_j, &tuning) else {
+                    continue;
+                };
+                if raw_pen > TWO_SYLLABLE_TOUCH_PENALTY_CAP {
+                    continue;
+                }
+                if keys_adjacent(c_j, pressed) && !geometry.adjacent(pressed, touch, c_j) {
+                    continue;
+                }
+                buf[local_idx] = c_j;
+                let Some(canon_syl) = canonical_intact_piece(&buf[..seg_slice.len()]) else {
+                    continue;
+                };
+                if canon_syl == cur_canon {
+                    continue;
+                }
+                let key = if b < seg0_len {
+                    format!("{canon_syl}'{}", segments[1])
+                } else {
+                    format!("{}'{canon_syl}", segments[0])
+                };
+                if let Some(existing) = candidate_keys.iter_mut().find(|(k, _)| k == &key) {
+                    existing.1 = existing.1.min(raw_pen);
+                } else {
+                    candidate_keys.push((key, raw_pen));
+                }
+            }
+        }
+        if candidate_keys.is_empty() {
+            return;
+        }
+        let mut misses: Vec<String> = Vec::new();
+        for (key, _) in &candidate_keys {
+            if self.typo_span_cache.get_ref(key).is_none() && !misses.contains(key) {
+                misses.push(key.clone());
+            }
+        }
+        if !misses.is_empty() {
+            let mut fetched = self
+                .database
+                .query_exact_keys_per_key(&misses, TYPO_ROWS_PER_KEY);
+            for key in misses {
+                let rows = fetched.remove(&key).unwrap_or_default();
+                self.typo_span_cache.insert(key, rows);
+            }
+        }
+
+        let full_len = raw.len();
+        let w_lit = result
+            .iter()
+            .filter(|row| {
+                row.source.is_dictionary()
+                    && row.corrected_from.is_empty()
+                    && !row.fuzzy
+                    && matched_letters(&row.canonical_pinyin) == full_len
+            })
+            .map(|row| row.weight.max(0))
+            .max()
+            .unwrap_or(0);
+
+        struct BestRescue {
+            word: String,
+            canonical_key: String,
+            weight: i64,
+            leads: bool,
+            rank_score: f64,
+        }
+        let mut best: Option<BestRescue> = None;
+        for (key, raw_pen) in &candidate_keys {
+            let Some(rows) = self.typo_span_cache.get_ref(key) else {
+                continue;
+            };
+            for row in rows {
+                if row.value.is_empty()
+                    || self
+                        .sentence_tables
+                        .offensive_words()
+                        .is_offensive(&row.value)
+                    || result.iter().any(|existing| existing.word == row.value)
+                {
+                    continue;
+                }
+                let w_corr = row.weight.max(0);
+                let leads = self.lead_allowed
+                    && *raw_pen <= tuning.lead_penalty
+                    && ((w_lit == 0 && w_corr >= 5_000)
+                        || (w_corr >= w_lit.saturating_mul(50) && w_corr >= 20_000));
+                let runner_up = *raw_pen <= TWO_SYLLABLE_TOUCH_PENALTY_CAP
+                    && w_corr >= w_lit.saturating_mul(5).max(2_000);
+                if !leads && !runner_up {
+                    continue;
+                }
+                let rank_score = (w_corr.max(1) as f64).ln() - QUANPIN_TYPO_PENALTY_SCALE * raw_pen;
+                let better = best.as_ref().is_none_or(|cur| {
+                    (leads, rank_score)
+                        .0
+                        .cmp(&cur.leads)
+                        .then_with(|| rank_score.total_cmp(&cur.rank_score))
+                        .is_gt()
+                });
+                if better {
+                    best = Some(BestRescue {
+                        word: row.value.clone(),
+                        canonical_key: row.key.clone(),
+                        weight: row.weight,
+                        leads,
+                        rank_score,
+                    });
+                }
+            }
+        }
+        let Some(best) = best else {
+            return;
+        };
+        let mut item = WordItem::new(
+            primary_segmentation,
+            best.word,
+            best.weight,
+            CandidateSource::Database,
+            best.canonical_key,
+        );
+        item.touch_supported = true;
+        item.corrected_from = fold_reading(raw).into();
+        if best.leads {
+            item.confident_correction = true;
+            result.insert(0, item);
+        } else {
+            let mut at = result
+                .iter()
+                .take_while(|row| {
+                    row.source.is_dictionary()
+                        && row.corrected_from.is_empty()
+                        && !row.fuzzy
+                        && matched_letters(&row.canonical_pinyin) == full_len
+                })
+                .count();
+            if at == 0
+                && result.first().is_some_and(|row| {
+                    row.corrected_from.is_empty() && matched_letters(&row.pinyin) == full_len
+                })
+            {
+                at = 1;
+            }
+            result.insert(at, item);
+        }
     }
 
     /// 完整词继续按词频合并，字面备选另外补齐前缀和整句，不能叠加一层纠错。
@@ -1453,21 +1766,58 @@ impl QuanpinDictionary {
         };
         let types = self.current_autocorrect_types;
         let typo_eligible = include_typos && types & TYPO_EDGE_TYPES != 0 && !raw.contains('\'');
+        let tuning = self.touch_tuning;
+        let lead_allowed = self.lead_allowed;
+        let touch_sig = if typo_eligible && segments.len() >= 3 {
+            self.touch_signature(raw)
+        } else {
+            None
+        };
+        let touched_slice = if typo_eligible && segments.len() >= 3 {
+            self.key_geometry.as_deref().and_then(|geometry| {
+                touch_slice(&self.key_touches, &self.touch_input, raw)
+                    .filter(|touches| {
+                        touches.iter().any(Option::is_some)
+                            && segments_align_with_raw(raw, segments, touches)
+                    })
+                    .map(|touches| (touches, geometry))
+            })
+        } else {
+            None
+        };
+        let mut priced_memo: Option<Vec<Vec<PricedQuanpinTypo>>> = None;
         let span_limit = options.span_limit;
         let database = &self.database;
         let span_cache = &mut self.typo_span_cache;
         let edit_cache = &mut self.typo_edit_cache;
         let profile = &*self.typo_profile;
         let mut typo_edges = |literal_best: &SentencePath| {
-            collect_typo_edges(
-                database,
-                span_cache,
-                edit_cache,
-                profile,
-                segments,
-                literal_best,
-                types,
-            )
+            if let Some((touches, geometry)) = touched_slice {
+                let variants = priced_memo.get_or_insert_with(|| {
+                    priced_quanpin_variants(
+                        raw, segments, touches, geometry, &tuning, profile, types,
+                    )
+                });
+                collect_priced_quanpin_typo_edges(
+                    database,
+                    span_cache,
+                    edit_cache,
+                    variants,
+                    segments,
+                    literal_best,
+                    types,
+                )
+            } else {
+                collect_typo_edges(
+                    database,
+                    span_cache,
+                    edit_cache,
+                    profile,
+                    segments,
+                    literal_best,
+                    types,
+                )
+            }
         };
         let typo_source: Option<&mut TypoEdgeSource<'_>> = if typo_eligible {
             Some(&mut typo_edges)
@@ -1476,12 +1826,13 @@ impl QuanpinDictionary {
         };
         // 模型已按需重载，此刻的版本就是这次解码用的版本。
         let personal_version = personal.version();
-        let decode_key = sentence_decode_key(
+        let decode_key = sentence_decode_key_with_touch(
             segments,
             types,
             typo_eligible,
             options.opens_sentence,
             options.beam_model.map(|model| model.context),
+            touch_sig.as_deref(),
         );
         let cached = self
             .sentence_decode_cache
@@ -1572,8 +1923,43 @@ impl QuanpinDictionary {
             return;
         }
         let mut at = whole_sentence_insert_position(result, segments);
-        if !typo.leads(options.typo_lead_margin) {
-            if typo.leads(TYPO_SECOND_SEAT_MARGIN)
+        let (touch_supported, confident) = if let Some((touches, geometry)) = touched_slice {
+            let variants = priced_memo.get_or_insert_with(|| {
+                priced_quanpin_variants(raw, segments, touches, geometry, &tuning, profile, types)
+            });
+            let supported = typo.score >= typo.literal_score - tuning.show_margin
+                && quanpin_touch_supports_correction(variants, &tuning, segments, &typo.key);
+            let full_len = raw.len();
+            let w_lit = result[..at]
+                .iter()
+                .filter(|item| {
+                    item.source.is_dictionary()
+                        && item.corrected_from.is_empty()
+                        && !item.fuzzy
+                        && matched_letters(&item.canonical_pinyin) == full_len
+                })
+                .map(|item| item.weight.max(0))
+                .max()
+                .unwrap_or(0);
+            let outweighs_literal_word = at == 0 || {
+                let lit_equiv_50 = ((w_lit.max(1) as f64 * 50.0) / options.unigram_z).ln()
+                    + (segments.len().saturating_sub(1) as f64) * options.phrase_length_bonus;
+                typo.score >= lit_equiv_50
+            };
+            let leads_first = lead_allowed
+                && supported
+                && touches.iter().all(Option::is_some)
+                && typo.leads(QUANPIN_TOUCH_LEAD_MARGIN)
+                && outweighs_literal_word
+                && quanpin_touch_leads_correction(variants, &tuning, segments, &typo.key);
+            (supported, leads_first)
+        } else {
+            (false, false)
+        };
+        if confident {
+            at = 0;
+        } else if !typo.leads(options.typo_lead_margin) {
+            if (typo.leads(TYPO_SECOND_SEAT_MARGIN) || touch_supported)
                 && result.get(at).is_some_and(|item| item.sentence_association)
             {
                 // 明显胜过字面整句的纠错句坐第一条整句后面；runtime 降位时保住这个座位（`ordering::runner_up_order_pinned`）。
@@ -1592,6 +1978,8 @@ impl QuanpinDictionary {
             typo.key,
         );
         sentence.sentence_association = true;
+        sentence.touch_supported = touch_supported;
+        sentence.confident_correction = confident;
         sentence.sentence_words = typo.words;
         sentence.corrected_from = fold_reading(raw).into();
         result.insert(at, sentence);
@@ -1733,15 +2121,36 @@ impl QuanpinDictionary {
         types: u32,
         project: impl FnOnce(Cow<'_, SeriesResolution>) -> T,
     ) -> T {
+        let touch_sig = self.touch_signature(raw);
         let segmentation_cache = &mut self.segmentation_cache;
-        project_cached_resolution_with(
+        let key_touches = &self.key_touches;
+        let touch_input = &self.touch_input;
+        let key_geometry = self.key_geometry.as_deref();
+        let touch_tuning = self.touch_tuning;
+        project_cached_resolution_with_touch(
             &mut self.resolution_cache,
             raw,
             segmentation,
             types,
+            touch_sig.as_deref(),
             || {
                 let segments = resolve_cached_segments(segmentation_cache, raw, segmentation);
-                resolve_series_query(raw, &segments, types)
+                if let Some((slice, geometry)) = key_geometry.and_then(|geom| {
+                    touch_slice(key_touches, touch_input, raw)
+                        .filter(|s| s.iter().any(Option::is_some))
+                        .map(|s| (s, geom))
+                }) {
+                    resolve_series_query_with_touch(
+                        raw,
+                        &segments,
+                        types,
+                        slice,
+                        Some(geometry),
+                        &touch_tuning,
+                    )
+                } else {
+                    resolve_series_query(raw, &segments, types)
+                }
             },
             project,
         )
@@ -1882,6 +2291,7 @@ fn project_cached_resolution<T>(
 }
 
 /// 解析热命中不调用构造闭包；常规查询因此可把音节拥有值延迟到真正未命中时。
+#[cfg(test)]
 fn project_cached_resolution_with<T>(
     cache: &mut FifoCache<u64, CachedResolution>,
     raw: &str,
@@ -1890,14 +2300,30 @@ fn project_cached_resolution_with<T>(
     resolve: impl FnOnce() -> SeriesResolution,
     project: impl FnOnce(Cow<'_, SeriesResolution>) -> T,
 ) -> (u64, T) {
-    let hash = resolution_cache_hash(types, raw, segmentation);
+    project_cached_resolution_with_touch(cache, raw, segmentation, types, None, resolve, project)
+}
+
+fn project_cached_resolution_with_touch<T>(
+    cache: &mut FifoCache<u64, CachedResolution>,
+    raw: &str,
+    segmentation: &str,
+    types: u32,
+    touch_sig: Option<&str>,
+    resolve: impl FnOnce() -> SeriesResolution,
+    project: impl FnOnce(Cow<'_, SeriesResolution>) -> T,
+) -> (u64, T) {
+    let hash = resolution_cache_hash_with_touch(types, raw, segmentation, touch_sig);
     if let Some(cached) = cache.get_ref(&hash) {
-        if resolution_cache_key_matches(&cached.key, types, raw, segmentation) {
+        if resolution_cache_key_matches_with_touch(&cached.key, types, raw, segmentation, touch_sig)
+        {
             return (hash, project(Cow::Borrowed(&cached.resolution)));
         }
     }
     let resolution = resolve();
-    let key = format!("{types}\u{1f}{raw}\u{1f}{segmentation}");
+    let key = match touch_sig {
+        Some(sig) => format!("{types}\u{1f}{raw}\u{1f}{segmentation}\u{1f}{sig}"),
+        None => format!("{types}\u{1f}{raw}\u{1f}{segmentation}"),
+    };
     cache.insert(
         hash,
         CachedResolution {
@@ -2036,19 +2462,22 @@ fn warm_lattice_span_cache(
 }
 
 /// `sentence_decode_cache` 的键：音节串、这次查询的纠错类型、是否规划纠错整句、是不是一句话的开头，以及挂着整句打分器时的上文。纠错整句只在纠错类型和规划允许时才解，句首的语气词要扣分（`LatticeOptions::opens_sentence`），同一串音节在这些情况下的结果不同。
-fn sentence_decode_key(
+fn sentence_decode_key_with_touch(
     segments: &[String],
     types: u32,
     typo_eligible: bool,
     opens_sentence: bool,
     model_context: Option<&str>,
+    touch_sig: Option<&str>,
 ) -> String {
+    let touch_extra = touch_sig.map_or(0, |sig| sig.len() + 1);
     let mut key = String::with_capacity(
         segments
             .iter()
             .map(|segment| segment.len() + 1)
             .sum::<usize>()
-            + 12,
+            + 12
+            + touch_extra,
     );
     for (index, segment) in segments.iter().enumerate() {
         if index > 0 {
@@ -2064,6 +2493,10 @@ fn sentence_decode_key(
     if let Some(context) = model_context {
         key.push('\u{1f}');
         key.push_str(context);
+    }
+    if let Some(sig) = touch_sig {
+        key.push('\u{1f}');
+        key.push_str(sig);
     }
     key
 }
@@ -2134,18 +2567,30 @@ fn truncate_last_segment(segmentation: &mut String) {
     }
 }
 
+#[cfg(test)]
 fn series_slot_key(
     cache_key: &str,
     options: &SentenceAssociationOptions,
     has_rerankers: bool,
     rescoring_context: &str,
 ) -> String {
+    series_slot_key_with_touch(cache_key, options, has_rerankers, rescoring_context, None)
+}
+
+fn series_slot_key_with_touch(
+    cache_key: &str,
+    options: &SentenceAssociationOptions,
+    has_rerankers: bool,
+    rescoring_context: &str,
+    touch_sig: Option<&str>,
+) -> String {
     let context_suffix = if has_rerankers {
         rescoring_context.len() + 1
     } else {
         0
     };
-    let mut slot = String::with_capacity(cache_key.len() + 5 + context_suffix);
+    let touch_suffix = touch_sig.map_or(0, |sig| sig.len() + 1);
+    let mut slot = String::with_capacity(cache_key.len() + 5 + context_suffix + touch_suffix);
     slot.push_str(cache_key);
     slot.push('\u{1f}');
     slot.push('S');
@@ -2159,6 +2604,10 @@ fn series_slot_key(
     if has_rerankers {
         slot.push('\u{1f}');
         slot.push_str(rescoring_context);
+    }
+    if let Some(sig) = touch_sig {
+        slot.push('\u{1f}');
+        slot.push_str(sig);
     }
     slot
 }
@@ -2319,19 +2768,44 @@ fn lookup_cached_segments(
     cache.get_ref_by(key).cloned()
 }
 
+#[cfg(test)]
 fn resolution_cache_hash(types: u32, raw: &str, segmentation: &str) -> u64 {
+    resolution_cache_hash_with_touch(types, raw, segmentation, None)
+}
+
+fn resolution_cache_hash_with_touch(
+    types: u32,
+    raw: &str,
+    segmentation: &str,
+    touch_sig: Option<&str>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     types.hash(&mut hasher);
     raw.hash(&mut hasher);
     segmentation.hash(&mut hasher);
+    if let Some(sig) = touch_sig {
+        sig.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
+#[cfg(test)]
 fn resolution_cache_key_matches(key: &str, types: u32, raw: &str, segmentation: &str) -> bool {
+    resolution_cache_key_matches_with_touch(key, types, raw, segmentation, None)
+}
+
+fn resolution_cache_key_matches_with_touch(
+    key: &str,
+    types: u32,
+    raw: &str,
+    segmentation: &str,
+    touch_sig: Option<&str>,
+) -> bool {
     let mut parts = key.split('\u{1f}');
     parts.next().and_then(|part| part.parse().ok()) == Some(types)
         && parts.next() == Some(raw)
         && parts.next() == Some(segmentation)
+        && parts.next() == touch_sig
         && parts.next().is_none()
 }
 
@@ -2429,7 +2903,7 @@ fn yield_stand_in_sentence_to_fuzzy_rows(result: &mut [WordItem]) {
     let Some(first) = result.first() else {
         return;
     };
-    if !first.sentence_association {
+    if !first.sentence_association || first.confident_correction {
         return;
     }
     let letters = matched_letters(&first.pinyin);

@@ -329,5 +329,77 @@ fn distance_squared((ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
     (ax - bx) * (ax - bx) + (ay - by) * (ay - by)
 }
 
+pub(crate) fn realign_touches(touches: &mut Vec<Option<KeyTouch>>, old: &[u8], new: &[u8]) {
+    if touches.is_empty() {
+        return;
+    }
+    debug_assert_eq!(touches.len(), old.len());
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let prefix = old[..old.len() - suffix]
+        .iter()
+        .zip(&new[..new.len() - suffix])
+        .take_while(|(left, right)| left == right)
+        .count();
+    touches.splice(
+        prefix..old.len() - suffix,
+        std::iter::repeat_n(None, new.len() - prefix - suffix),
+    );
+    if touches.iter().all(Option::is_none) {
+        touches.clear();
+    }
+}
+
+pub(crate) fn touch_slice<'a>(
+    touches: &'a [Option<KeyTouch>],
+    input: &str,
+    touched: &str,
+) -> Option<&'a [Option<KeyTouch>]> {
+    if touches.is_empty() || !input.starts_with(touched) {
+        return None;
+    }
+    let touches = &touches[..touched.len()];
+    touches.iter().any(Option::is_some).then_some(touches)
+}
+
+pub(crate) fn touch_signature(
+    touches: &[Option<KeyTouch>],
+    input: &str,
+    touched: &str,
+    geometry: Option<&KeyGeometry>,
+    lead_allowed: bool,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let touches = touch_slice(touches, input, touched)?;
+    let geometry = geometry?;
+    let mut signature = String::with_capacity(32 + touches.len() * 4);
+    signature.push('\u{2}');
+    let _ = write!(
+        signature,
+        "{}:{:016x}",
+        geometry.id(),
+        geometry.fingerprint()
+    );
+    for touch in touches {
+        match touch {
+            Some(touch) => {
+                signature.push('\u{4}');
+                for byte in [touch.dx as u8, touch.dy as u8, touch.copy] {
+                    signature.push(char::from(byte));
+                }
+            }
+            None => signature.push('\u{3}'),
+        }
+    }
+    if lead_allowed {
+        signature.push('\u{5}');
+    }
+    Some(signature)
+}
+
 #[cfg(test)]
 mod tests;

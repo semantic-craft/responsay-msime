@@ -81,6 +81,23 @@ pub(crate) fn intact_piece(bytes: &[u8]) -> Option<&'static str> {
     intact_pinyin_set().get(piece).copied()
 }
 
+pub(crate) fn canonical_intact_piece(bytes: &[u8]) -> Option<&'static str> {
+    let syllable = intact_piece(bytes)?;
+    Some(match syllable {
+        "nue" => "nve",
+        "lue" => "lve",
+        "jv" => "ju",
+        "jve" => "jue",
+        "qv" => "qu",
+        "qve" => "que",
+        "xv" => "xu",
+        "xve" => "xue",
+        "yv" => "yu",
+        "yve" => "yue",
+        other => other,
+    })
+}
+
 /// Whether `bytes` is a prefix of some intact syllable (see `intact_piece` for the byte handling).
 pub(crate) fn is_prefix_piece(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes).is_ok_and(is_prefix)

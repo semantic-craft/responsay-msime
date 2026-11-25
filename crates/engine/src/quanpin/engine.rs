@@ -70,6 +70,7 @@ impl QuanpinEngine {
             0
         };
         if helpcode_length == 0 {
+            self.set_key_touches(request);
             return self.dictionary.query(
                 &request.raw_input,
                 &request.segmentation,
@@ -77,6 +78,7 @@ impl QuanpinEngine {
                 request.fuzzy_pinyin,
             );
         }
+        self.dictionary.clear_key_touches();
 
         let base = strip_active_helpcodes(&request.raw_input, &request.raw_input_with_cases);
         // An active helpcode follows complete pinyin, so the base always has a cut.
@@ -123,16 +125,19 @@ impl QuanpinEngine {
         }
         let segments = split_segments(&request.segmentation);
         match segments.first() {
-            Some(first) if first.len() == 1 => self.dictionary.expand_initial_candidates(
-                &request.raw_input,
-                &request.segmentation,
-                request_autocorrect_mask(
-                    request.enable_quanpin_autocorrect_transposition,
-                    request.enable_quanpin_autocorrect_neighbor,
-                ),
-                first,
-                candidates,
-            ),
+            Some(first) if first.len() == 1 => {
+                self.set_key_touches(request);
+                self.dictionary.expand_initial_candidates(
+                    &request.raw_input,
+                    &request.segmentation,
+                    request_autocorrect_mask(
+                        request.enable_quanpin_autocorrect_transposition,
+                        request.enable_quanpin_autocorrect_neighbor,
+                    ),
+                    first,
+                    candidates,
+                )
+            }
             _ => false,
         }
     }
@@ -144,6 +149,16 @@ impl QuanpinEngine {
         words: &[String],
         source: CandidateSource,
     ) -> bool {
+        let helpcode_length = if request.enable_quanpin_helpcode {
+            detect_active_helpcode_length(&request.raw_input, &request.raw_input_with_cases)
+        } else {
+            0
+        };
+        if helpcode_length == 0 {
+            self.set_key_touches(request);
+        } else {
+            self.dictionary.clear_key_touches();
+        }
         self.dictionary.insert_online_words(
             &request.raw_input,
             &request.segmentation,
@@ -154,6 +169,21 @@ impl QuanpinEngine {
             words,
             source,
         )
+    }
+
+    fn set_key_touches(&mut self, request: &QueryRequest) {
+        let lead_allowed = !request.raw_input.is_empty()
+            && !request.raw_input.contains('\'')
+            && request.key_touches.len() == request.raw_input.len()
+            && request.key_touches.iter().all(Option::is_some)
+            && request.key_geometry.is_some();
+        self.dictionary.set_key_touches(
+            &request.key_touches,
+            &request.raw_input,
+            request.key_geometry.as_ref(),
+            request.touch_tuning,
+            lead_allowed,
+        );
     }
 
     pub fn clear_online_candidates(&mut self, source: CandidateSource) {

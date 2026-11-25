@@ -47,7 +47,7 @@ use crate::quanpin::dictionary::{
 };
 use crate::quanpin::series::fold_reading;
 use crate::text::last_characters;
-use crate::touch::{KeyGeometry, KeyTouch, TouchTuning};
+use crate::touch::{touch_signature, touch_slice, KeyGeometry, KeyTouch, TouchTuning};
 use crate::types::{
     CandidateSource, FuzzyPinyinOptions, SentenceAssociationOptions, ShuangpinProfileKind,
     SyllableHelpcode, WordItem,
@@ -246,32 +246,13 @@ impl ShuangpinDictionary {
 
     /// `touched` 这段输入的触点签名：几何代次和内容指纹，加上每个位置量化后的触点。代次不够：宿主可能用同一个代次下发挪过键的几何，同样的量化触点在新布局下计价不同，只认代次会把旧布局算出的答案当缓存命中。`touched` 不是带触点的那串输入的前缀（模糊音替换过的拼写、直接辅助码去掉辅码的串）或这一段一个触点都没有时为空，缓存键和没有触点时一样。
     fn touch_signature(&self, touched: &str) -> Option<String> {
-        use std::fmt::Write as _;
-        let touches = touch_slice(&self.key_touches, &self.touch_input, touched)?;
-        let geometry = self.key_geometry.as_ref()?;
-        let mut signature = String::with_capacity(32 + touches.len() * 4);
-        signature.push('\u{2}');
-        let _ = write!(
-            signature,
-            "{}:{:016x}",
-            geometry.id(),
-            geometry.fingerprint()
-        );
-        for touch in touches {
-            match touch {
-                Some(touch) => {
-                    signature.push('\u{4}');
-                    for byte in [touch.dx as u8, touch.dy as u8, touch.copy] {
-                        signature.push(char::from(byte));
-                    }
-                }
-                None => signature.push('\u{3}'),
-            }
-        }
-        if self.lead_allowed {
-            signature.push('\u{5}');
-        }
-        Some(signature)
+        touch_signature(
+            &self.key_touches,
+            &self.touch_input,
+            touched,
+            self.key_geometry.as_deref(),
+            self.lead_allowed,
+        )
     }
 
     /// 逐音节辅助码约束跟着请求走；签名拼在系列/辅助码缓存键后面，同一串拼音带不同约束不共用答案。
@@ -1243,18 +1224,6 @@ fn typo_codes<'a>(
 }
 
 /// `touched` 是带触点的那串输入 `input` 的前缀、且这一段至少有一个触点时，返回这一段的触点。
-fn touch_slice<'a>(
-    touches: &'a [Option<KeyTouch>],
-    input: &str,
-    touched: &str,
-) -> Option<&'a [Option<KeyTouch>]> {
-    if touches.is_empty() || !input.starts_with(touched) {
-        return None;
-    }
-    let touches = &touches[..touched.len()];
-    touches.iter().any(Option::is_some).then_some(touches)
-}
-
 fn prefix_group_count(segmentation: &str) -> usize {
     segmentation.matches('\'').count()
 }

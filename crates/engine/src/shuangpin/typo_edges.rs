@@ -230,9 +230,14 @@ pub fn touch_correction_pairs(
     let decoded = &profile_tables(profile).decoded;
     let types = autocorrect_types & SHUANGPIN_TYPO_TYPES;
     let mut pairs = Vec::new();
-    for (position, (code, corrected)) in typed.as_bytes().chunks_exact(2).zip(corrected).enumerate()
+    for (position, (&code, corrected)) in typed
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(corrected)
+        .enumerate()
     {
-        let code = [code[0], code[1]];
         let literal = decoded_syllable(decoded, code);
         let corrected = normalized_syllable(corrected);
         if Some(corrected.as_str()) == literal {

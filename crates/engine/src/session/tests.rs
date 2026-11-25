@@ -1242,12 +1242,17 @@ fn a_pending_touch_reaches_only_the_next_shuangpin_letter() {
     assert!(request_touches(&session).is_empty());
     session.command(Command::Cancel);
 
-    // 全拼不收触点。
     let mut quanpin = fixture.session_with(|_| {});
     quanpin.set_key_geometry(Some(touch_geometry()));
     quanpin.set_key_touch(touch);
     quanpin.character(b'n', false);
-    assert!(quanpin.input.engine.request().key_touches.is_empty());
+    assert_eq!(request_touches(&quanpin), [touch]);
+
+    let mut wubi = fixture.session_with(|options| options.scheme = SchemeType::Wubi);
+    wubi.set_key_geometry(Some(touch_geometry()));
+    wubi.set_key_touch(touch);
+    wubi.character(b'g', false);
+    assert!(wubi.input.engine.request().key_touches.is_empty());
 }
 
 /// 以词定字、结束组字、移光标这些不派发字符的入口同样一开头丢掉待用触点：设了触点之后先调它们，下一个字母不带触点。
@@ -15797,6 +15802,171 @@ fn committed_pinyin_spans_validate_exact_full_pinyin_with_learning_disabled() {
     session.command(Command::Cancel);
 
     assert!(!fixture.paths().user(crate::assets::USER_JOURNAL).exists());
+}
+
+#[test]
+fn quanpin_spatial_touch_rescues_border_slips_and_false_redirects_without_clean_flips() {
+    let fixture = Fixture::new(
+        "CREATE TABLE tbl_1_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_j VALUES('jun','j','均',20000);
+         INSERT INTO tbl_1_j VALUES('jin','j','今',80000);
+         CREATE TABLE tbl_1_t(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_t VALUES('tian','t','田',40000);
+         CREATE TABLE tbl_1_q(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_q VALUES('qi','q','气',90000);
+         CREATE TABLE tbl_1_g(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_g VALUES('gua','g','瓜',42569);
+         INSERT INTO tbl_1_g VALUES('gai','g','该',1970136);
+         CREATE TABLE tbl_1_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_c VALUES('cong','c','从',900000);
+         CREATE TABLE tbl_2_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_j VALUES('jun''tian','jt','均田',524);
+         INSERT INTO tbl_2_j VALUES('jin''tian','jt','今天',1755608);
+         CREATE TABLE tbl_2_t(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_t VALUES('tian''qi','tq','天气',167293);
+         CREATE TABLE tbl_2_n(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_n VALUES('ni''hao','nh','你好',500000);
+         CREATE TABLE tbl_2_z(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_z VALUES('zhong''guo','zg','中国',800000);
+         CREATE TABLE tbl_4_w(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_4_w VALUES('wo''men''jin''tian','wmjt','我们今天',300000);",
+    );
+
+    let mut keys = [[0.0f32; 4]; 26];
+    for (letters, left, y) in [
+        ("qwertyuiop", 5.0, 7.0),
+        ("asdfghjkl", 10.0, 21.0),
+        ("zxcvbnm", 20.0, 35.0),
+    ] {
+        for (col, byte) in letters.bytes().enumerate() {
+            keys[usize::from(byte - b'a')] = [left + 10.0 * col as f32, y, 10.0, 14.0];
+        }
+    }
+    let geom = std::sync::Arc::new(crate::touch::KeyGeometry::new(7, &keys, None, &[]).unwrap());
+    let key_center = |ch: u8| -> (f32, f32) {
+        let rect = keys[usize::from(ch - b'a')];
+        (rect[0], rect[1])
+    };
+
+    let mut options = SessionOptions::new(fixture.paths().clone());
+    options.learning = false;
+    options.personal_context = false;
+    options.autocorrect_types = crate::types::autocorrect_type::TRANSPOSITION
+        | crate::types::autocorrect_type::NEIGHBOR
+        | crate::types::autocorrect_type::MISSING_OR_EXTRA;
+    let mut session = Session::new(options).unwrap();
+    session.switch_scheme(SchemeType::Quanpin).unwrap();
+    session.set_key_geometry(Some(std::sync::Arc::clone(&geom)));
+
+    let type_touched = |session: &mut Session, seq: &[(u8, f32, f32)]| {
+        for &(ch, x, y) in seq {
+            session.set_key_touch(geom.touch(ch, x, y));
+            session.character(ch, false);
+        }
+    };
+
+    let center_seq = |text: &str| -> Vec<(u8, f32, f32)> {
+        text.bytes()
+            .map(|ch| {
+                let (cx, cy) = key_center(ch);
+                (ch, cx, cy)
+            })
+            .collect()
+    };
+
+    type_touched(&mut session, &center_seq("juntian"));
+    assert_eq!(words(&session).first().map(String::as_str), Some("均田"));
+    assert!(!words(&session).iter().any(|w| w == "今天"));
+    session.command(Command::Cancel);
+
+    let mut border_juntian = center_seq("juntian");
+    border_juntian[1] = (b'u', 70.0, 7.0);
+    type_touched(&mut session, &border_juntian);
+    assert_eq!(words(&session).first().map(String::as_str), Some("今天"));
+    assert_eq!(words(&session).get(1).map(String::as_str), Some("均田"));
+    assert!(session.display_snapshot().candidates[0].confident_correction);
+    assert!(session.display_snapshot().candidates[0].touch_supported);
+    assert_eq!(
+        session.display_snapshot().candidates[0]
+            .corrected_from
+            .as_str(),
+        "juntian"
+    );
+    session.command(Command::CommitCandidate);
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+
+    let mut false_redirect_juntian = center_seq("juntian");
+    false_redirect_juntian[1] = (b'u', 74.0, 7.0);
+    type_touched(&mut session, &false_redirect_juntian);
+    assert_eq!(words(&session).first().map(String::as_str), Some("今天"));
+    session.command(Command::Cancel);
+
+    let mut gau_center = center_seq("gau");
+    type_touched(&mut session, &gau_center);
+    assert_eq!(words(&session).first().map(String::as_str), Some("瓜"));
+    session.command(Command::Cancel);
+    gau_center[2] = (b'u', 70.0, 7.0);
+    type_touched(&mut session, &gau_center);
+    assert_eq!(words(&session).first().map(String::as_str), Some("该"));
+    session.command(Command::CommitCandidate);
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+
+    type_touched(&mut session, &center_seq("juntiantianqi"));
+    assert_eq!(
+        words(&session).first().map(String::as_str),
+        Some("均田天气")
+    );
+    session.command(Command::Cancel);
+
+    let mut border_sentence = center_seq("juntiantianqi");
+    border_sentence[1] = (b'u', 70.0, 7.0);
+    type_touched(&mut session, &border_sentence);
+    assert_eq!(
+        words(&session).first().map(String::as_str),
+        Some("今天天气")
+    );
+    assert!(session.display_snapshot().candidates[0].confident_correction);
+    assert!(session.display_snapshot().candidates[0].touch_supported);
+    assert_eq!(
+        session.display_snapshot().candidates[0]
+            .corrected_from
+            .as_str(),
+        "juntiantianqi"
+    );
+    session.command(Command::CommitCandidate);
+    assert!(!session.last_committed_pinyin_spans()[0].is_exact_uncorrected_full_pinyin);
+
+    for clean in [
+        "nihao",
+        "zhongguo",
+        "womenjintian",
+        "juntian",
+        "juntiantianqi",
+    ] {
+        session.set_key_geometry(None);
+        type_text(&mut session, clean);
+        let touchless_top = words(&session).first().cloned();
+        session.command(Command::Cancel);
+
+        session.set_key_geometry(Some(std::sync::Arc::clone(&geom)));
+        let jittered: Vec<(u8, f32, f32)> = clean
+            .bytes()
+            .enumerate()
+            .map(|(idx, ch)| {
+                let (cx, cy) = key_center(ch);
+                let dx = if idx % 2 == 0 { 2.0 } else { -2.0 };
+                let dy = if idx % 3 == 0 { 2.5 } else { -2.5 };
+                (ch, cx + dx, cy + dy)
+            })
+            .collect();
+        type_touched(&mut session, &jittered);
+        assert_eq!(
+            words(&session).first().cloned(),
+            touchless_top,
+            "clean jittered input `{clean}` changed Top-1"
+        );
+        session.command(Command::Cancel);
+    }
 }
 
 mod caret_suffix;

@@ -9,7 +9,7 @@ use super::query::{
     to_quanpin_segmentation_into,
 };
 use super::ShuangpinProfile;
-use crate::touch::{KeyGeometry, KeyTouch};
+use crate::touch::{realign_touches, KeyGeometry, KeyTouch};
 use crate::types::{QueryRequest, SchemeKey, SchemeType};
 use std::sync::Arc;
 
@@ -276,32 +276,6 @@ impl ShuangpinScheme {
     #[cfg(test)]
     pub(crate) fn touches(&self) -> &[Option<KeyTouch>] {
         &self.touches
-    }
-}
-
-/// 宿主改写了输入串（光标处插入或删除、部分选词吃掉前缀、交出光标前的部分、撤销时补回前缀）：新旧串的公共后缀和公共前缀保留原来的触点，中间新出现的字节没有触点。先认后缀再在剩下的部分里认前缀：吃掉或补回前缀是确定的改动，`xpxp`（谢谢）选走第一个字剩下的 `xp` 必须对上后两键的触点，先认前缀会错拿刚选走那两键的。`hh` 这类相同的相邻字母在光标处删改时分不清是哪一个，触点可能互换，影响很小。
-fn realign_touches(touches: &mut Vec<Option<KeyTouch>>, old: &[u8], new: &[u8]) {
-    if touches.is_empty() {
-        return;
-    }
-    debug_assert_eq!(touches.len(), old.len());
-    let suffix = old
-        .iter()
-        .rev()
-        .zip(new.iter().rev())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let prefix = old[..old.len() - suffix]
-        .iter()
-        .zip(&new[..new.len() - suffix])
-        .take_while(|(left, right)| left == right)
-        .count();
-    touches.splice(
-        prefix..old.len() - suffix,
-        std::iter::repeat_n(None, new.len() - prefix - suffix),
-    );
-    if touches.iter().all(Option::is_none) {
-        touches.clear();
     }
 }
 

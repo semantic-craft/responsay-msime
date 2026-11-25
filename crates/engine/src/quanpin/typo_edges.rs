@@ -6,11 +6,15 @@ use crate::cache::FifoCache;
 use crate::dictionary::pinyin::PinyinDatabase;
 use crate::dictionary::DictRow;
 use crate::lattice::{SentencePath, TypoEdge};
-use crate::pinyin::syllables::{intact_pinyin_list, MAX_SYLLABLE_LENGTH};
+use crate::pinyin::syllables::{
+    canonical_intact_piece, intact_pinyin_list, normalized_syllable, MAX_SYLLABLE_LENGTH,
+};
 use crate::pinyin::typos::{
-    autocorrect_bit, base_cost, discounted, syllable_typos, SyllableTypo, SyllableTypoKind,
+    autocorrect_bit, base_cost, discounted, keys_adjacent, syllable_typos, SyllableTypo,
+    SyllableTypoKind, NEIGHBOR_COST,
 };
 use crate::text::count_utf8_chars;
+use crate::touch::{KeyGeometry, KeyTouch, TouchTuning};
 use crate::user_dictionary::typo_profile::PersonalTypoProfile;
 
 /// Typo edges are looked up for at most this many variant keys per query, most of them cache hits while typing on.
@@ -748,6 +752,278 @@ pub(crate) struct PricedTypo<'a> {
     pub penalty: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PricedQuanpinTypo {
+    pub syllable: &'static str,
+    pub penalty: f64,
+    pub raw_penalty: f64,
+    pub neighbor_raw_penalty: Option<f64>,
+}
+
+pub(crate) fn segments_align_with_raw(
+    raw: &str,
+    segments: &[String],
+    touches: &[Option<KeyTouch>],
+) -> bool {
+    !raw.contains('\'')
+        && touches.len() == raw.len()
+        && segments.iter().map(String::len).sum::<usize>() == raw.len()
+        && segments
+            .iter()
+            .flat_map(|segment| segment.bytes())
+            .zip(raw.bytes())
+            .all(|(seg_byte, raw_byte)| {
+                let fold = |byte: u8| if byte == b'v' { b'u' } else { byte };
+                fold(seg_byte) == fold(raw_byte.to_ascii_lowercase())
+            })
+}
+
+fn discounted_touch_penalty(raw_penalty: f64, accepted: i32, tuning: &TouchTuning) -> f64 {
+    if accepted <= 0 {
+        return raw_penalty;
+    }
+    let discount = NEIGHBOR_COST - discounted(NEIGHBOR_COST, accepted);
+    (raw_penalty - discount).max(tuning.min_penalty.min(raw_penalty))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn priced_quanpin_variants(
+    raw: &str,
+    segments: &[String],
+    touches: &[Option<KeyTouch>],
+    geometry: &KeyGeometry,
+    tuning: &TouchTuning,
+    profile: &PersonalTypoProfile,
+    autocorrect_types: u32,
+) -> Vec<Vec<PricedQuanpinTypo>> {
+    debug_assert!(segments_align_with_raw(raw, segments, touches));
+    let raw_bytes = raw.as_bytes();
+    let mut byte_offset = 0usize;
+    let mut result = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let len = segment.len();
+        let seg_raw = &raw_bytes[byte_offset..byte_offset + len];
+        let seg_touches = &touches[byte_offset..byte_offset + len];
+        byte_offset += len;
+        let mut variants: Vec<PricedQuanpinTypo> = Vec::new();
+        let mut upsert =
+            |syllable: &'static str, penalty: f64, raw_penalty: f64, neighbor_raw: Option<f64>| {
+                if let Some(existing) = variants.iter_mut().find(|item| item.syllable == syllable) {
+                    existing.penalty = existing.penalty.min(penalty);
+                    existing.raw_penalty = existing.raw_penalty.min(raw_penalty);
+                    if let Some(nr) = neighbor_raw {
+                        existing.neighbor_raw_penalty =
+                            Some(existing.neighbor_raw_penalty.map_or(nr, |cur| cur.min(nr)));
+                    }
+                    return;
+                }
+                variants.push(PricedQuanpinTypo {
+                    syllable,
+                    penalty,
+                    raw_penalty,
+                    neighbor_raw_penalty: neighbor_raw,
+                });
+            };
+
+        if autocorrect_types & crate::types::autocorrect_type::NEIGHBOR != 0
+            && (1..=MAX_SYLLABLE_LENGTH).contains(&len)
+        {
+            let mut buf = [0u8; MAX_SYLLABLE_LENGTH];
+            for (idx, &byte) in seg_raw.iter().enumerate() {
+                buf[idx] = byte.to_ascii_lowercase();
+            }
+            for idx in 0..len {
+                let pressed = buf[idx];
+                let touch = seg_touches[idx];
+                for key in b'a'..=b'z' {
+                    if key == pressed {
+                        continue;
+                    }
+                    buf[idx] = key;
+                    let Some(canonical) = canonical_intact_piece(&buf[..len]) else {
+                        continue;
+                    };
+                    if canonical == segment.as_str() {
+                        continue;
+                    }
+                    let flat = keys_adjacent(key, pressed);
+                    let accepted = profile.accepted(segment, canonical);
+                    let (penalty, raw_penalty) = match touch
+                        .and_then(|t| geometry.penalty(pressed, t, key, tuning).map(|p| (t, p)))
+                    {
+                        Some((t, raw_p)) if flat => {
+                            if !geometry.adjacent(pressed, t, key) {
+                                continue;
+                            }
+                            (discounted_touch_penalty(raw_p, accepted, tuning), raw_p)
+                        }
+                        Some((_, raw_p)) => {
+                            let disc = discounted_touch_penalty(raw_p, accepted, tuning);
+                            if disc > tuning.cut {
+                                continue;
+                            }
+                            (disc, raw_p)
+                        }
+                        None if flat => (discounted(NEIGHBOR_COST, accepted), NEIGHBOR_COST),
+                        None => continue,
+                    };
+                    upsert(canonical, penalty, raw_penalty, Some(raw_penalty));
+                }
+                buf[idx] = pressed;
+            }
+        }
+
+        for typo in syllable_typos(segment) {
+            if typo.kind == SyllableTypoKind::Neighbor
+                || autocorrect_types & autocorrect_bit(typo.kind) == 0
+            {
+                continue;
+            }
+            let Some(canonical) = canonical_intact_piece(typo.syllable.as_bytes()) else {
+                continue;
+            };
+            if canonical == segment.as_str() {
+                continue;
+            }
+            let raw_p = base_cost(typo.kind);
+            let disc = discounted(raw_p, profile.accepted(segment, canonical));
+            upsert(canonical, disc, raw_p, None);
+        }
+
+        variants.sort_by(|left, right| left.penalty.total_cmp(&right.penalty));
+        result.push(variants);
+    }
+    result
+}
+
+pub(crate) fn collect_priced_quanpin_typo_edges(
+    database: &PinyinDatabase,
+    span_cache: &mut FifoCache<String, Vec<DictRow>>,
+    edit_cache: &mut EditWindowCache,
+    variants: &[Vec<PricedQuanpinTypo>],
+    segments: &[String],
+    literal_best: &SentencePath,
+    autocorrect_types: u32,
+) -> Vec<TypoEdge> {
+    debug_assert_eq!(variants.len(), segments.len());
+    let mut planned = plan_priced_keys_by(
+        segments,
+        literal_best,
+        |position| variants[position].as_slice(),
+        |typo| (typo.syllable, typo.penalty),
+    );
+    plan_priced_tail_keys(segments, variants, &mut planned);
+    plan_edit_keys(
+        segments,
+        literal_best,
+        autocorrect_types,
+        edit_cache,
+        &mut planned,
+    );
+    for entry in &mut planned {
+        entry.penalty *= QUANPIN_TYPO_PENALTY_SCALE;
+    }
+    lookup_planned_edges(database, span_cache, &planned)
+}
+
+fn plan_priced_tail_keys(
+    segments: &[String],
+    variants: &[Vec<PricedQuanpinTypo>],
+    planned: &mut Vec<PlannedKey>,
+) {
+    let n = segments.len();
+    if n < MIN_TYPO_SPAN_SYLLABLES || variants.len() != n {
+        return;
+    }
+    let max_len = MAX_TAIL_TYPO_SPAN_SYLLABLES.min(n);
+    let mut added = 0usize;
+    for position in (n.saturating_sub(2)..n).rev() {
+        for typo in &variants[position] {
+            for length in MIN_TYPO_SPAN_SYLLABLES..=max_len {
+                let first = (position + 1).saturating_sub(length);
+                for start in first..=position {
+                    let end = start + length;
+                    if end > n {
+                        break;
+                    }
+                    let key = typo_span_key(segments, start, end, position - start, typo.syllable);
+                    if planned
+                        .iter()
+                        .any(|entry| entry.start == start && entry.end == end && entry.key == key)
+                    {
+                        continue;
+                    }
+                    planned.push(PlannedKey {
+                        start,
+                        end,
+                        key,
+                        penalty: typo.penalty,
+                    });
+                    added += 1;
+                    if added >= TAIL_TYPO_KEY_BUDGET {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn quanpin_touch_supports_correction(
+    variants: &[Vec<PricedQuanpinTypo>],
+    tuning: &TouchTuning,
+    segments: &[String],
+    corrected_key: &str,
+) -> bool {
+    let corrected: Vec<&str> = corrected_key.split('\'').collect();
+    if corrected.len() != segments.len() || variants.len() != segments.len() {
+        return false;
+    }
+    let mut any_changed = false;
+    for ((corr, lit), pos_variants) in corrected.iter().zip(segments).zip(variants) {
+        let corr = normalized_syllable(corr);
+        if corr == normalized_syllable(lit) {
+            continue;
+        }
+        any_changed = true;
+        if !pos_variants
+            .iter()
+            .any(|v| v.syllable == corr && v.raw_penalty <= tuning.show_penalty)
+        {
+            return false;
+        }
+    }
+    any_changed
+}
+
+pub(crate) fn quanpin_touch_leads_correction(
+    variants: &[Vec<PricedQuanpinTypo>],
+    tuning: &TouchTuning,
+    segments: &[String],
+    corrected_key: &str,
+) -> bool {
+    let corrected: Vec<&str> = corrected_key.split('\'').collect();
+    if corrected.len() != segments.len() || variants.len() != segments.len() {
+        return false;
+    }
+    let mut any_changed = false;
+    for ((corr, lit), pos_variants) in corrected.iter().zip(segments).zip(variants) {
+        let corr = normalized_syllable(corr);
+        if corr == normalized_syllable(lit) {
+            continue;
+        }
+        any_changed = true;
+        if !pos_variants.iter().any(|v| {
+            v.syllable == corr
+                && v.neighbor_raw_penalty
+                    .is_some_and(|raw_p| raw_p <= tuning.lead_penalty)
+        }) {
+            return false;
+        }
+    }
+    any_changed
+}
+
 /// 双拼带触点时的规划与查词。`variants_at(i)` 给出第 i 个音节已经按纠错开关筛过、按罚分计过价的变体。与 [`collect_span_typo_edges`] 不同，所有位置的所有变体按罚分全局升序排，罚分相同时弱位置优先，所以 96 个键的预算不会被前一两个位置的便宜类型吃光；跨度、去重、查词和缓存相同。
 pub(crate) fn collect_priced_span_typo_edges<'t>(
     database: &PinyinDatabase,
@@ -764,6 +1040,17 @@ fn plan_priced_keys<'t>(
     segments: &[String],
     literal_best: &SentencePath,
     variants_at: impl Fn(usize) -> &'t [PricedTypo<'t>],
+) -> Vec<PlannedKey> {
+    plan_priced_keys_by(segments, literal_best, variants_at, |typo| {
+        (typo.syllable, typo.penalty)
+    })
+}
+
+fn plan_priced_keys_by<'t, T: 't>(
+    segments: &[String],
+    literal_best: &SentencePath,
+    variants_at: impl Fn(usize) -> &'t [T],
+    project: impl Fn(&T) -> (&str, f64),
 ) -> Vec<PlannedKey> {
     let n = segments.len();
     // 弱位置的判定与 `plan_keys_with` 相同：最优字面路径里单独成字的音节最可能是按错打断了词。
@@ -783,10 +1070,11 @@ fn plan_priced_keys<'t>(
     if covered != n {
         weak.clear();
     }
-    let mut order: Vec<(f64, bool, usize, &PricedTypo<'t>)> = Vec::new();
+    let mut order: Vec<(f64, bool, usize, &str)> = Vec::new();
     for position in 0..n {
-        for typo in variants_at(position) {
-            order.push((typo.penalty, !weak.get(position), position, typo));
+        for item in variants_at(position) {
+            let (syllable, penalty) = project(item);
+            order.push((penalty, !weak.get(position), position, syllable));
         }
     }
     // 稳定排序：同价同强弱时按位置，同一位置内保持给出的次序。
@@ -798,20 +1086,15 @@ fn plan_priced_keys<'t>(
     });
 
     let mut planned = Vec::new();
-    'variants: for (penalty, _, position, typo) in order {
+    'variants: for (penalty, _, position, syllable) in order {
         for length in MIN_TYPO_SPAN_SYLLABLES..=MAX_TYPO_SPAN_SYLLABLES.min(n) {
             let first = (position + 1).saturating_sub(length);
             for start in first..=position {
                 if start + length > n {
                     break;
                 }
-                let key = typo_span_key(
-                    segments,
-                    start,
-                    start + length,
-                    position - start,
-                    typo.syllable,
-                );
+                let key =
+                    typo_span_key(segments, start, start + length, position - start, syllable);
                 if planned_key_seen(&planned, &key) {
                     continue;
                 }

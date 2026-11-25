@@ -174,6 +174,13 @@ impl Scheme {
         }
     }
 
+    pub fn as_quanpin_mut(&mut self) -> Option<&mut QuanpinScheme> {
+        match self {
+            Self::Quanpin(scheme) => Some(scheme),
+            _ => None,
+        }
+    }
+
     pub fn as_shuangpin_mut(&mut self) -> Option<&mut ShuangpinScheme> {
         match self {
             Self::Shuangpin(scheme) => Some(scheme),

@@ -4,10 +4,14 @@ use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::pinyin::autocorrect::{
-    autocorrect_cut_kbest, looks_like_syllable_with_jianpin_tail, AutocorrectCut,
+    autocorrect_cut_kbest, autocorrect_cut_kbest_with_touch, looks_like_syllable_with_jianpin_tail,
+    AutocorrectCut,
 };
 use crate::pinyin::segment::join_segments;
-use crate::pinyin::syllables::{has_only_complete_pinyin_segments, is_intact, is_prefix};
+use crate::pinyin::syllables::{
+    has_only_complete_pinyin_segments, is_intact, is_prefix, normalize_umlaut_aliases,
+};
+use crate::touch::{KeyGeometry, KeyTouch, TouchTuning};
 use crate::types::{autocorrect_type, CandidateSource, WordItem};
 
 /// How many ranked correction cuts feed the query pipeline: the primary cut becomes the query key and the rest ride along as alternative segmentations. Dropped-initial keys such as `uan` have 10-15 equally weighted deletion targets (cuan/duan/guan/...), and k = 3 cut the list by table order before reaching the right reading (quan'li for uanli); k = 9 lifted R@1/R@3 on the deletion and mixed eval sets with no p95 change (QD:90-97).
@@ -46,6 +50,24 @@ pub fn resolve_series_query(
     segments: &[String],
     autocorrect_types: u32,
 ) -> SeriesResolution {
+    resolve_series_query_with_touch(
+        raw,
+        segments,
+        autocorrect_types,
+        &[],
+        None,
+        &TouchTuning::default(),
+    )
+}
+
+pub fn resolve_series_query_with_touch(
+    raw: &str,
+    segments: &[String],
+    autocorrect_types: u32,
+    touches: &[Option<KeyTouch>],
+    geometry: Option<&KeyGeometry>,
+    tuning: &TouchTuning,
+) -> SeriesResolution {
     let mut result = SeriesResolution::default();
     // Guard order matters: the jianpin-shape predicate runs before the search so a guarded input never pays for it. Both guards say "the user did not mistype". The base segmentation is deliberately not part of the gate: the search works on the raw letters, and an empty base cut (a dropped initial such as uanli for quan'li) is often exactly the input that needs correcting.
     let eligible = autocorrect_types != 0
@@ -53,10 +75,23 @@ pub fn resolve_series_query(
         && !has_only_complete_pinyin_segments(segments)
         && !looks_like_syllable_with_jianpin_tail(raw);
     if eligible {
-        let cuts = autocorrect_cut_kbest(raw, autocorrect_types, AUTOCORRECT_CUT_KBEST);
+        let has_touches =
+            geometry.is_some() && touches.len() == raw.len() && touches.iter().any(Option::is_some);
+        let cuts = if has_touches {
+            autocorrect_cut_kbest_with_touch(
+                raw,
+                autocorrect_types,
+                AUTOCORRECT_CUT_KBEST,
+                touches,
+                geometry,
+                tuning,
+            )
+        } else {
+            autocorrect_cut_kbest(raw, autocorrect_types, AUTOCORRECT_CUT_KBEST)
+        };
         if !cuts.is_empty() {
             result.corrected_input = true;
-            populate_from_cuts(&mut result, cuts, "");
+            populate_from_cuts(&mut result, cuts, "", has_touches);
         } else {
             // The k-best search only reaches the end when every segment is a complete syllable, so "hauzh" (hau typo + zh jianpin) fails outright. Retry on the head without a trailing incomplete syllable, shortest tail first so the correction explains as much of the input as possible. Neighbor corrections are left out of the head: they have the widest false-positive surface, and stacking them on a speculative jianpin boundary turns deletion-shaped input into noise (shng -> sun + g -> 笋干).
             let head_types = autocorrect_types & !autocorrect_type::NEIGHBOR;
@@ -72,7 +107,7 @@ pub fn resolve_series_query(
                     continue;
                 }
                 result.corrected_input = true;
-                populate_from_cuts(&mut result, head_cuts, tail);
+                populate_from_cuts(&mut result, head_cuts, tail, false);
                 break;
             }
         }
@@ -99,9 +134,13 @@ fn populate_from_cuts(
     result: &mut SeriesResolution,
     cuts: Vec<AutocorrectCut>,
     jianpin_tail: &str,
+    normalize_aliases: bool,
 ) {
     let to_segments = |cut: AutocorrectCut| {
         let mut segments = cut.into_syllables();
+        if normalize_aliases {
+            normalize_umlaut_aliases(&mut segments);
+        }
         if !jianpin_tail.is_empty() {
             segments.push(jianpin_tail.to_string());
         }

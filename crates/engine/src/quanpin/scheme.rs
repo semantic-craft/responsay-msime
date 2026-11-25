@@ -1,8 +1,11 @@
 //! Quanpin key handling and request building (`R/schemes/quanpin_scheme.cpp`, quanpin.md §3.5).
 
+use std::sync::Arc;
+
 use crate::pinyin::active_helpcode::{detect_active_helpcode_length, strip_active_helpcodes};
 use crate::pinyin::segment::{cut_pinyin_by_mode, join_segments, CutMode};
 use crate::shuangpin::query::{apply_segmentation_cases_into, remove_manual_delimiters};
+use crate::touch::{realign_touches, KeyGeometry, KeyTouch};
 use crate::types::{QueryRequest, SchemeKey, SchemeType};
 
 fn replace_string(target: &mut String, source: String) {
@@ -16,6 +19,9 @@ fn replace_string(target: &mut String, source: String) {
 #[derive(Debug, Clone, Default)]
 pub struct QuanpinScheme {
     raw: String,
+    touches: Vec<Option<KeyTouch>>,
+    pending_touch: Option<KeyTouch>,
+    key_geometry: Option<Arc<KeyGeometry>>,
 }
 
 impl QuanpinScheme {
@@ -23,32 +29,66 @@ impl QuanpinScheme {
         Self::default()
     }
 
+    pub fn set_key_geometry(&mut self, geometry: Option<Arc<KeyGeometry>>) {
+        if self.key_geometry != geometry {
+            self.touches.clear();
+            self.pending_touch = None;
+        }
+        self.key_geometry = geometry;
+    }
+
+    pub fn set_pending_touch(&mut self, touch: Option<KeyTouch>) {
+        self.pending_touch = touch;
+    }
+
+    fn push_touch(&mut self, touch: Option<KeyTouch>) {
+        if self.touches.is_empty() {
+            if touch.is_none() {
+                return;
+            }
+            self.touches.resize(self.raw.len() - 1, None);
+        }
+        self.touches.push(touch);
+        debug_assert_eq!(self.touches.len(), self.raw.len());
+    }
+
     pub fn reset(&mut self) {
         self.raw.clear();
+        self.touches.clear();
+        self.pending_touch = None;
     }
 
     /// Letters keep their case; `'` is appended unless the last character already is one; Backspace pops; Escape and Return reset.
     pub fn handle_key(&mut self, key: SchemeKey) -> bool {
-        match key {
+        let touch = self.pending_touch.take();
+        let pushed = match key {
             SchemeKey::Letter(letter) if letter.is_ascii_alphabetic() => {
                 self.raw.push(char::from(letter));
-                true
+                touch.filter(|_| letter.is_ascii_lowercase())
             }
             SchemeKey::Apostrophe => {
                 if !self.raw.ends_with('\'') {
                     self.raw.push('\'');
-                    true
+                    None
                 } else {
-                    false
+                    return false;
                 }
             }
-            SchemeKey::Backspace => self.raw.pop().is_some(),
+            SchemeKey::Backspace => {
+                if self.raw.pop().is_none() {
+                    return false;
+                }
+                self.touches.truncate(self.raw.len());
+                return true;
+            }
             SchemeKey::Letter(_)
             | SchemeKey::Semicolon
             | SchemeKey::Minus
             | SchemeKey::Symbol(_)
-            | SchemeKey::Requery => false,
-        }
+            | SchemeKey::Requery => return false,
+        };
+        self.push_touch(pushed);
+        true
     }
 
     /// The correction-mode request (QS:142-155).
@@ -61,6 +101,25 @@ impl QuanpinScheme {
     /// 将全拼请求写入已有存储，避免逐键刷新重复分配按键和切分字符串。
     pub fn build_request_into(&self, request: &mut QueryRequest) {
         Self::build_request_from_raw_into(&self.raw, &self.raw, request);
+        request.key_touches.clear();
+        request.key_geometry = None;
+        let Some(geometry) = &self.key_geometry else {
+            return;
+        };
+        let helpcode_length = if request.enable_quanpin_helpcode {
+            detect_active_helpcode_length(&request.raw_input, &request.raw_input_with_cases)
+        } else {
+            0
+        };
+        if request.valid
+            && helpcode_length == 0
+            && self.touches.iter().any(Option::is_some)
+            && request.raw_input.len() == self.touches.len()
+            && !self.raw.contains('\'')
+        {
+            request.key_touches.extend_from_slice(&self.touches);
+            request.key_geometry = Some(Arc::clone(geometry));
+        }
     }
 
     /// 从原文直接写入查询请求，光标前缀查询不必创建临时方案。
@@ -97,9 +156,15 @@ impl QuanpinScheme {
         } else {
             raw_with_cases
         };
+        realign_touches(&mut self.touches, self.raw.as_bytes(), source.as_bytes());
         self.raw.clear();
         self.raw.reserve(source.len());
         self.raw.push_str(source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn touches(&self) -> &[Option<KeyTouch>] {
+        &self.touches
     }
 
     /// Fill a request's segmentation fields from its raw input with the given cut (QS:82-139): active helpcodes stripped, cases re-applied, trailing `'` and helpcode letters re-appended.
@@ -300,5 +365,88 @@ mod tests {
         let request = typed("'").build_request();
         assert!(!request.valid);
         assert!(!QuanpinScheme::new().build_request().valid);
+    }
+
+    fn test_geometry(id: u32, shift_x: f32) -> Arc<KeyGeometry> {
+        let mut keys = [[0.0f32; 4]; 26];
+        for (row, letters) in ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+            .into_iter()
+            .enumerate()
+        {
+            for (col, byte) in letters.bytes().enumerate() {
+                keys[usize::from(byte - b'a')] = [
+                    10.0 + shift_x + 10.0 * col as f32,
+                    10.0 + 14.0 * row as f32,
+                    10.0,
+                    14.0,
+                ];
+            }
+        }
+        Arc::new(KeyGeometry::new(id, &keys, None, &[]).unwrap())
+    }
+
+    #[test]
+    fn quanpin_touch_tracking_handles_case_apostrophe_realign_and_geometry_changes() {
+        let mut scheme = QuanpinScheme::new();
+        scheme.handle_key(SchemeKey::Letter(b'n'));
+        assert!(scheme.touches().is_empty());
+        assert_eq!(scheme.touches.capacity(), 0);
+        scheme.reset();
+
+        let geom1 = test_geometry(1, 0.0);
+        scheme.set_key_geometry(Some(Arc::clone(&geom1)));
+        let t1 = KeyTouch {
+            dx: 2,
+            dy: -1,
+            copy: 0,
+        };
+        let t2 = KeyTouch {
+            dx: -3,
+            dy: 4,
+            copy: 0,
+        };
+        scheme.set_pending_touch(Some(t1));
+        scheme.handle_key(SchemeKey::Letter(b'j'));
+        scheme.set_pending_touch(Some(t2));
+        scheme.handle_key(SchemeKey::Letter(b'u'));
+        scheme.handle_key(SchemeKey::Letter(b'n'));
+        assert_eq!(scheme.touches(), &[Some(t1), Some(t2), None]);
+
+        let req = scheme.build_request();
+        assert_eq!(req.key_touches, vec![Some(t1), Some(t2), None]);
+        assert!(req.key_geometry.is_some());
+
+        scheme.set_key_geometry(Some(test_geometry(1, 0.0)));
+        assert_eq!(scheme.touches(), &[Some(t1), Some(t2), None]);
+
+        scheme.handle_key(SchemeKey::Backspace);
+        assert_eq!(scheme.touches(), &[Some(t1), Some(t2)]);
+
+        scheme.set_raw_input("u", "u");
+        assert_eq!(scheme.touches(), &[Some(t2)]);
+
+        scheme.set_raw_input("ju", "ju");
+        assert_eq!(scheme.touches(), &[None, Some(t2)]);
+
+        scheme.set_pending_touch(Some(t1));
+        scheme.handle_key(SchemeKey::Letter(b'A'));
+        assert_eq!(scheme.touches(), &[None, Some(t2), None]);
+        let mut req_help = QueryRequest {
+            enable_quanpin_helpcode: true,
+            ..QueryRequest::default()
+        };
+        scheme.build_request_into(&mut req_help);
+        assert!(req_help.key_touches.is_empty());
+        assert!(req_help.key_geometry.is_none());
+
+        scheme.handle_key(SchemeKey::Backspace);
+        scheme.handle_key(SchemeKey::Apostrophe);
+        assert_eq!(scheme.touches(), &[None, Some(t2), None]);
+        let req_apos = scheme.build_request();
+        assert!(req_apos.key_touches.is_empty());
+        assert!(req_apos.key_geometry.is_none());
+
+        scheme.set_key_geometry(Some(test_geometry(2, 1.0)));
+        assert!(scheme.touches().is_empty());
     }
 }

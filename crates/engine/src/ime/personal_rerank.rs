@@ -45,7 +45,7 @@ pub(crate) fn personal_context_rerank_order(
     is_pinned: &mut dyn FnMut(&str) -> bool,
 ) -> Option<PersonalContextRerankOrder> {
     let first = candidates.first()?;
-    if candidates.len() < 2 || !first.source.is_dictionary() {
+    if candidates.len() < 2 || !first.source.is_dictionary() || first.confident_correction {
         return None;
     }
     let context = model.context(earlier, Some(previous));

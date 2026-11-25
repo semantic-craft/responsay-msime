@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 use super::active_helpcode::strip_active_helpcodes;
 #[cfg(test)]
 use super::syllables::is_intact;
-use super::syllables::{intact_piece, intact_pinyin_list, is_prefix_piece, MAX_SYLLABLE_LENGTH};
+use super::syllables::{
+    canonical_intact_piece, intact_piece, intact_pinyin_list, is_prefix_piece, MAX_SYLLABLE_LENGTH,
+};
+use crate::touch::{KeyGeometry, KeyTouch, TouchTuning};
 use crate::types::autocorrect_type;
 
 /// Tie-break weights; the corrected-edge count is always the primary key (QUH:73-84).
@@ -694,6 +697,170 @@ pub fn autocorrect_cut_detail(pinyin: &str, autocorrect_types: u32) -> Option<Au
         .next()
 }
 
+fn single_substitution_pos(wrong: &[u8], correct: &[u8]) -> Option<usize> {
+    if wrong.len() != correct.len() {
+        return None;
+    }
+    let mut diff = None;
+    for (index, (&left, &right)) in wrong.iter().zip(correct).enumerate() {
+        if left != right {
+            if diff.is_some() {
+                return None;
+            }
+            diff = Some(index);
+        }
+    }
+    diff
+}
+
+fn touch_cut_weight(penalty: f64) -> i32 {
+    (penalty * 0.85 + 2.5).round().clamp(6.0, 22.0) as i32
+}
+
+pub fn autocorrect_cut_kbest_with_touch(
+    pinyin: &str,
+    autocorrect_types: u32,
+    k: usize,
+    touches: &[Option<KeyTouch>],
+    geometry: Option<&KeyGeometry>,
+    tuning: &TouchTuning,
+) -> Vec<AutocorrectCut> {
+    let Some(geometry) =
+        geometry.filter(|_| touches.len() == pinyin.len() && touches.iter().any(Option::is_some))
+    else {
+        return autocorrect_cut_kbest(pinyin, autocorrect_types, k);
+    };
+    if k == 0
+        || autocorrect_types == 0
+        || pinyin.is_empty()
+        || pinyin.len() > MAX_AUTOCORRECT_INPUT_LENGTH
+        || pinyin.contains('\'')
+    {
+        return Vec::new();
+    }
+    let index = correction_index();
+    let bytes = pinyin.as_bytes();
+    let length = bytes.len();
+    let mut search = Search::new(length, k);
+    search.best[0].push(Hypothesis {
+        edge_count: 0,
+        prev_index: NO_PREDECESSOR,
+        arrival: 0,
+        weight: 0,
+        raw_length: 0,
+        syllable: "",
+        corrected: false,
+        sequence: 0,
+    });
+    for start in 0..length {
+        search.finalize(start);
+        if search.best[start].is_empty() {
+            continue;
+        }
+        for raw_length in (1..=(length - start).min(MAX_SYLLABLE_LENGTH)).rev() {
+            let piece = &bytes[start..start + raw_length];
+            if let Some(syllable) = intact_piece(piece) {
+                search.extend(length, start, raw_length, syllable, false, 0);
+                continue;
+            }
+            if raw_length == 2 && start + 2 == length && is_prefix_piece(&piece[1..]) {
+                continue;
+            }
+            if let Some(targets) = index.get(piece) {
+                for target in targets {
+                    let enabled_bits = autocorrect_types & target.type_bits();
+                    if enabled_bits == 0 {
+                        continue;
+                    }
+                    let syllable = target.syllable();
+                    let weight =
+                        if let Some(pos) = single_substitution_pos(piece, syllable.as_bytes()) {
+                            if let Some(touch) = touches[start + pos] {
+                                let intended = syllable.as_bytes()[pos];
+                                if !geometry.adjacent(piece[pos], touch, intended) {
+                                    continue;
+                                }
+                                geometry
+                                    .penalty(piece[pos], touch, intended, tuning)
+                                    .map_or(NEIGHBOR_WEIGHT, touch_cut_weight)
+                            } else {
+                                correction_weight_bytes(piece, syllable, enabled_bits)
+                            }
+                        } else {
+                            correction_weight_bytes(piece, syllable, enabled_bits)
+                        };
+                    search.extend(length, start, raw_length, syllable, true, weight);
+                }
+            }
+            if autocorrect_types & autocorrect_type::NEIGHBOR != 0
+                && (raw_length >= 3 || (raw_length == 2 && !two_letters_readable(piece)))
+            {
+                let mut buf = [0u8; MAX_SYLLABLE_LENGTH];
+                buf[..raw_length].copy_from_slice(piece);
+                for pos in 0..raw_length {
+                    let Some(touch) = touches[start + pos] else {
+                        continue;
+                    };
+                    let pressed = piece[pos];
+                    if !pressed.is_ascii_lowercase() {
+                        continue;
+                    }
+                    let flat_neighbors = neighbors(pressed);
+                    for candidate in b'a'..=b'z' {
+                        if candidate == pressed || flat_neighbors.contains(&candidate) {
+                            continue;
+                        }
+                        buf[pos] = candidate;
+                        let Some(syllable) = canonical_intact_piece(&buf[..raw_length]) else {
+                            continue;
+                        };
+                        if let Some(penalty) = geometry.penalty(pressed, touch, candidate, tuning) {
+                            if penalty <= tuning.cut {
+                                search.extend(
+                                    length,
+                                    start,
+                                    raw_length,
+                                    syllable,
+                                    true,
+                                    touch_cut_weight(penalty),
+                                );
+                            }
+                        }
+                    }
+                    buf[pos] = pressed;
+                }
+            }
+        }
+    }
+    search.finalize(length);
+
+    search.best[length]
+        .iter()
+        .map(|hypothesis| {
+            let mut segments = Vec::with_capacity(length);
+            let mut position = length;
+            let mut current = *hypothesis;
+            while current.prev_index != NO_PREDECESSOR {
+                let start = position - current.raw_length;
+                segments.push(AutocorrectCutSegment {
+                    syllable: current.syllable.to_owned(),
+                    raw_text: pinyin[start..position].to_owned(),
+                    start,
+                    corrected: current.corrected,
+                });
+                position = start;
+                current = search.best[position][current.prev_index];
+            }
+            segments.reverse();
+            AutocorrectCut {
+                segments,
+                edge_count: hypothesis.edge_count,
+                weight: hypothesis.weight,
+            }
+        })
+        .collect()
+}
+
 /// Greedy intact syllables then at most one trailing consonant (QU:187-243): `zheg` is protected from correction, `gau` stays eligible for `gua`.
 pub fn looks_like_syllable_with_jianpin_tail(pinyin: &str) -> bool {
     // Manual delimiters mark boundaries the user chose and never reach correction.
@@ -1365,6 +1532,57 @@ mod tests {
             backing_bytes < 256 * 1024,
             "紧凑索引常驻堆内存 {backing_bytes} 字节超出 256 KiB 上限"
         );
+    }
+
+    fn qwerty_geometry() -> KeyGeometry {
+        let mut keys = [[0.0f32; 4]; 26];
+        for (letters, left, y) in [
+            ("qwertyuiop", 5.0, 7.0),
+            ("asdfghjkl", 10.0, 21.0),
+            ("zxcvbnm", 20.0, 35.0),
+        ] {
+            for (col, byte) in letters.bytes().enumerate() {
+                keys[usize::from(byte - b'a')] = [left + 10.0 * col as f32, y, 10.0, 14.0];
+            }
+        }
+        KeyGeometry::new(1, &keys, None, &[]).unwrap()
+    }
+
+    #[test]
+    fn spatial_touch_cut_promotes_border_neighbor_and_preserves_center_and_touchless() {
+        let geom = qwerty_geometry();
+        let tuning = TouchTuning::default();
+        let mask = autocorrect_type::TRANSPOSITION | autocorrect_type::NEIGHBOR;
+
+        let touchless = autocorrect_cut_kbest("gau", mask, 4);
+        let empty_touch =
+            autocorrect_cut_kbest_with_touch("gau", mask, 4, &[], Some(&geom), &tuning);
+        assert_eq!(empty_touch, touchless);
+        assert_eq!(touchless[0].segments[0].syllable, "gua");
+
+        let g_center = geom.touch(b'g', 50.0, 21.0);
+        let a_center = geom.touch(b'a', 10.0, 21.0);
+        let u_center = geom.touch(b'u', 65.0, 7.0);
+        let center_cuts = autocorrect_cut_kbest_with_touch(
+            "gau",
+            mask,
+            4,
+            &[g_center, a_center, u_center],
+            Some(&geom),
+            &tuning,
+        );
+        assert_eq!(center_cuts[0].segments[0].syllable, "gua");
+
+        let u_near_i = geom.touch(b'u', 70.0, 7.0);
+        let border_cuts = autocorrect_cut_kbest_with_touch(
+            "gau",
+            mask,
+            4,
+            &[g_center, a_center, u_near_i],
+            Some(&geom),
+            &tuning,
+        );
+        assert_eq!(border_cuts[0].segments[0].syllable, "gai");
     }
 }
 

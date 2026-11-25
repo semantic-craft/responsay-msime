@@ -421,6 +421,7 @@ impl ImeSession {
             }
         }
         self.bind_wubi_scheme();
+        self.bind_quanpin_scheme();
         self.bind_shuangpin_scheme();
         self.state = CompositionState::default();
         self.pinyin_tail = false;
@@ -960,6 +961,13 @@ impl ImeSession {
         )
     }
 
+    fn bind_quanpin_scheme(&mut self) {
+        let geometry = self.key_geometry.clone();
+        if let Some(quanpin) = self.scheme.as_quanpin_mut() {
+            quanpin.set_key_geometry(geometry);
+        }
+    }
+
     /// 大写段按当时的触发方式解析，方案层要拿到和敲键时一致的设置（`configure_shuangpin_scheme`）。键位几何同样跟着方案走。
     fn bind_shuangpin_scheme(&mut self) {
         let triggers = self.helpcode_uppercase_triggers();
@@ -973,6 +981,7 @@ impl ImeSession {
     /// 宿主注册（或清除）的键位几何，见 [`crate::touch::KeyGeometry`]。不刷新候选：几何只影响之后的查询。
     pub fn set_key_geometry(&mut self, geometry: Option<Arc<KeyGeometry>>) {
         self.key_geometry = geometry;
+        self.bind_quanpin_scheme();
         self.bind_shuangpin_scheme();
     }
 
@@ -980,9 +989,10 @@ impl ImeSession {
         self.touch_tuning = tuning;
     }
 
-    /// 紧接着的那一次 `handle_key` 的触点；只有双拼方案收，其余方案没有触点可用。
     pub fn set_pending_touch(&mut self, touch: Option<KeyTouch>) {
-        if let Some(shuangpin) = self.scheme.as_shuangpin_mut() {
+        if let Some(quanpin) = self.scheme.as_quanpin_mut() {
+            quanpin.set_pending_touch(touch);
+        } else if let Some(shuangpin) = self.scheme.as_shuangpin_mut() {
             shuangpin.set_pending_touch(touch);
         }
     }
@@ -1203,6 +1213,17 @@ impl ImeSession {
             request.end_helpcodes.clear();
         }
         request.enable_quanpin_helpcode = self.quanpin_helpcode;
+        if request.scheme == SchemeType::Quanpin
+            && self.quanpin_helpcode
+            && !request.key_touches.is_empty()
+            && crate::pinyin::active_helpcode::detect_active_helpcode_length(
+                &request.raw_input,
+                &request.raw_input_with_cases,
+            ) > 0
+        {
+            request.key_touches.clear();
+            request.key_geometry = None;
+        }
         request.strict_quanpin_helpcode = self.strict_quanpin_helpcode;
         request.sentence_alternatives = self.sentence_alternatives;
         request.sentence_pool = self.sentence_pool;
@@ -1241,6 +1262,8 @@ impl ImeSession {
         }
         request.enable_quanpin_autocorrect_transposition = false;
         request.enable_quanpin_autocorrect_neighbor = false;
+        request.key_touches.clear();
+        request.key_geometry = None;
         QuanpinScheme::apply_literal_segmentation(request);
     }
 
