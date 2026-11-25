@@ -1,115 +1,76 @@
 # AGENTS.md
 
-给在本仓库工作的编码代理的操作约定。**架构边界、验证流程和各平台的验证覆盖面在 [ARCHITECTURE.md](docs/ARCHITECTURE.md)，贡献流程在 [CONTRIBUTING.md](.github/CONTRIBUTING.md)——先读那两份，这里只写它们没有覆盖的操作细节。**
+给在本仓库工作的编码代理的操作约定。**架构边界、验证流程与各平台覆盖面见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)，贡献流程见 [CONTRIBUTING.md](.github/CONTRIBUTING.md)；先读这两份，本文只写它们未覆盖的操作细节。**
 
 ## 改动范围
 
-- 只暂存明确列出的路径，不用 `git add -A`。
-- **一个 issue 一个 PR。** 处理 GitHub issue 时，每个 issue 单独一条分支、一个 PR，正文写 `Fixes #N`；只有 issue 要求的行为或平台还有一部分没实现时才写 `Refs #N`，并在正文列出还差什么。没在真机、报告者环境或真实编辑器里验收过不算没做完：缺的验收写进 PR 的验证段，需要报告者复验就在合并后到 issue 里请对方确认，照样写 `Fixes`。不要把几个 issue 合进同一个 PR，即使它们是同一次一起处理的。做某件事时顺带发现、没有对应 issue 的小问题，并进那件事的 PR，不必另开。#7045 把 7 个互不相关的 issue（AI 候选占位、Linux 设置窗口闪烁、DeepL、五笔查码、Android 图片发送、Caps Lock 切换、候选栏跟随光标）塞进一个横跨六个平台的 PR，审查、合并和回滚都没法按 issue 分开，几项还没补完的验证也跟着其余的一起进了 develop。见 `.agents/notes/implemented/process/2026-10-11-one-issue-one-pr.md`。
-- **Issue 调查评论要合并发布。** 先在本地代码、测试、上游资料和决策笔记中累积证据；同一轮调查只给 issue 发一条总结性评论，写清结论、证据和下一步。已有自己的评论时优先编辑或合并已有评论，不连续追加每条命令、每个搜索结果或中间进度；需要报告者补充时一次列全必要字段，没有新证据不重复催促。机器人转述且没有真人补充的 issue 可按授权关闭，有真人报告或材料的 issue 必须保留并对应处理。
-- 不复制相邻仓库的未提交内容；上游来源以远端实际默认分支和固定提交为准。
-- **「把功能对齐某个平台」不等于「把默认值改成那个平台的出厂值」。** 对齐的验收标准是**能力可达**：字段存在、有宿主读、设置页有控件、行为能按用户选择生效。出厂默认值属于产品决策，会改变现有用户的手感，必须单独授权。做对齐任务时若发现默认值与参考平台不同，**只记录不改**，把差异表写进决策笔记（参考平台出厂值、本仓现值、为什么这次不动）。2026-10-22 一次「补齐 Windows 对齐」的 PR 顺手把 `helpcode.enabled`、`emoji`、`kaomoji`、`navigation.left_right` 等 7 个默认值翻成 Windows 出厂值，被维护者当场指出越界：这些翻转会静默改变所有 macOS 老用户的输入手感，且没有单独评审。这条不限于对齐任务：任何改变已有设置出厂值、或改变缺字段时怎么读的 PR，正文都要链接维护者的授权（issue 或评论）；推翻不到一周前刚定下的默认值，还要链接原决策笔记并写明是谁要求翻转。2026-10-31 的 #10386 把 `touch_quanpin_shift` 改成缺字段按开启，推翻了 10-26 笔记里刚定的「默认关」，没有关联 issue 也没写授权，老用户文档里本来就没有这个字段，手感被直接改掉。
-- 日志、测试和提交中不得包含真实输入、凭据或私人资料，测试数据使用合成值。
-- CI 会在 Pull Request 上运行，提交前仍先跑本地 quick 门禁。发布 workflow 一律手动触发，不要在任务没有明确要求发布时去碰它们。
-- **develop 红着时先修红。** 最近一次合进 develop 后的推送 CI（Core CI、Native Platform CI、iOS CI、macOS CI、macOS package）或 nightly 失败时，先修它；修好之前不合并功能 PR，除非这次失败已经在对应的 `ci-red` issue 里写明原因、确认与要合的 PR 无关。开 PR 前先看 `gh run list --branch develop --limit 10` 和 `gh issue list --label ci-red`，有红的就在 PR 正文写明红在哪、与本 PR 有没有关系。2026-10-25 到 10-27 的 nightly 连红三天没人发现，Android 瘦包超出体积上限和只在 Fedora 上失败的 Linux ctest 都混在常态的红里进了 develop。见 `.agents/notes/implemented/process/2026-10-28-ci-red-tracking.md`。
-- **连着合几个 PR 时，每合一个，下一个先跟上新的 develop、等必过检查在新的基础上转绿再合。** PR 上的检查跑的是「PR 分支 + 当时的 develop」，前一个 PR 合进去之后，下一个 PR 的绿灯就过期了：一个删了符号，另一个还在用，两边各自全绿，合在一起编不过。后合的 PR 和刚合进去的改了同一个平台或共享代码（`crates/`、`shared/`、`packages/`）时，先 `gh pr update-branch <n>`，再 `gh pr checks <n> --required --watch`，绿了再合；互不相干的平台可以直接合。2026-10-30 先合了删掉 `voiceShortcutKey` 的 #10322，五分钟后合了检查跑在旧 develop 上、测试还引用它的 #10318，develop 的 iOS 测试编不过，靠 #10332 补上。见 `.agents/notes/implemented/process/2026-10-30-push-and-merge-sequencing.md`。
-- **改了文件读写、目录遍历、权限或安卓资源（drawable、主题、布局），合并前在安卓模拟器上跑过再说「验证过」。** macOS 上的单测和 CI 的编译、lint 都碰不到 Android 的限制：应用对 `/data` 只有搜索权限、SELinux 禁止应用建硬链接、Android 9 的 `GradientDrawable` 读不到带主题属性的径向渐变半径。0.3.0 带着这三个问题发出去（词库准备失败、匿名账号写不进、Android 9 一打开就崩溃），编译、lint 和 JVM 测试全绿。本机做法：`bash platforms/android/tests/device/start-emulator.sh 28`（35 同理），`MSIME_ANDROID_TEST_SERIAL=emulator-5566 bash platforms/android/tests/device/build-core-test.sh` 编出 client-base、client-core、client-providers 和 client-services 的单测，经 cargo runner `run-core-test.sh` 在设备上整套运行，再跑 msime-engine 里词库维护租约的单测，再用 `smoke.sh emulator-5566 --core` 装包验收（API 35 不带 `--core`）。CI 的 `android-device.yml` 在合进 develop 后和发版前跑同样的两步；PR 上只有改了键盘或设置界面时才在 API 35 上跑一遍（`android-device-pr`，见 `.agents/notes/implemented/process/2026-10-28-android-device-on-ui-prs.md`），API 28 和其他改动仍要靠本机跑过。
-- **PR 里的截图和效果图一律上传到 sugi.moe，嵌进 PR 正文。** 涉及界面的改动都要有对比图：改了界面、图标、配色、字体、布局或任何看得见的东西的 PR，正文的「截图」一节必须附改前和改后的图，按真实尺寸、真实底色截或画，系统会再裁剪的图标要按裁剪后的样子给；不改视觉的 PR 在这一节写「无」。上传用 `sugi up <图片>`（`curl -fsSL https://sugi.moe/install.sh | bash` 安装；维护者本机也可以用 sugi 仓库的 `bin/sugi-upload`，不限速）或 `curl -F file=@<图片> https://sugi.moe/api/upload`，也可以在 https://sugi.moe 网页上拖拽，返回的 `https://files.sugi.moe/<id>.<扩展名>` 是文件本身的直链；匿名上传每个 IP 每 10 秒最多 5 次，返回 429 就等 10 秒再传，用 `![说明](链接)` 嵌入；贴进正文之前把链接下载回来，确认是图片且与本地文件逐字节一致。sugi.moe 是项目自建的匿名图床，暂时不可用时退回 files.catbox.moe 的直链；tmpfiles.org、file.io 这类靠广告变现的匿名文件站一律不用，它们的落地页有伪装成下载按钮的恶意广告。上传是公开、永久的，自己删不掉，图里不能出现真实输入、账号、个人资料、本机路径或凭据。本机的截图照常留着，上传是另外一份。见 `.agents/notes/implemented/process/2026-11-02-pr-images-on-sugi.md`。
-- **不要把 Tauri 生成的工程当成某个平台的产品去启动、调试或验收。** 每个平台的产品本体都是 `platforms/<os>` 下的原生宿主，Tauri/React 只是公共组件，而且不是每个宿主都承载它：共享 React 设置页只在 macOS、Linux（Tauri 设置应用）和 HarmonyOS（ArkWeb 加载的 rawfile，不经过 Tauri）上作为设置界面出现，Windows 的原生宿主只拉起 Tauri 的共享面板，iOS App 与 Android 发布 APK 两者都不含（见 docs/ARCHITECTURE.md 的「设置界面按平台归属」）。装机、启动和设备验收一律针对原生宿主；`apps/desktop` 的目录名和 Tauri 生成工程里自带的 bundle id 都不构成例外。
-- **界面正在全部迁到原生，`packages/ui` 只修缺陷，不加新设置。** 新的设置功能先把校验、默认值和业务规则写进共享 Rust（`client-core` / `client-services` / `client-providers`，经 `host-api` 提供），再在已有原生设置的平台上做界面；不要往 Tauri/React 里加新页面、新面板或新入口，也不要新增任何 WebView 宿主。迁移顺序是 Windows → macOS → HarmonyOS → Linux，见 `.agents/notes/proposed/architecture/2026-11-03-all-native-ui.md`。
+- 只暂存明确列出的路径，禁 `git add -A`。不复制相邻仓库未提交内容；上游以远端默认分支与固定提交为准。日志、测试和提交禁含真实输入、凭据或隐私，测试数据用合成值。
+- **一个 issue 一个 PR。** 每个 issue 独占分支与 PR，写 `Fixes #N`；仅当行为或平台未做全时写 `Refs #N` 并列缺口。未在真机、报告者环境或真实编辑器复验不算未做完（写进验证段，合并后请报告者确认，仍写 `Fixes`）。禁多 issue 合一 PR；顺手修的无 issue 小问题并入当前 PR。见 [2026-10-11-one-issue-one-pr.md](.agents/notes/implemented/process/2026-10-11-one-issue-one-pr.md)。
+- **Issue 调查评论合并发布。** 本地集齐代码、测试、上游与笔记证据后，同轮调查只发一条总结评论（结论、证据、下一步）；已有评论优先编辑合并，不逐条刷中间命令。需报告者补充时一次列全字段，无新据不催。纯机器人转述无真人补充可按授权关闭，有真人报告或材料的必留并处理。
+- **「把功能对齐某个平台」不等于「把默认值改成那个平台的出厂值」。** 对齐标准是**能力可达**（字段存在、宿主读取、设置页有控件、按选择生效）。出厂默认值改变老用户手感，须单独授权；对齐时发现默认值不同**只记入决策笔记不改**（列参考值、现值、不动原因）。任何改已有出厂值或缺字段读法的 PR 须链接维护者授权（issue/评论）；推翻一周内刚定的默认值还须链原笔记并写明要求人。见 [2026-11-02-merge-and-code-health-lessons.md](.agents/notes/implemented/process/2026-11-02-merge-and-code-health-lessons.md)。
+- **提交前跑本地 quick 门禁；`develop` 红着时先修红。** 发布 workflow 仅手动触发，无发布指令禁碰。最近一次 `develop` 推送 CI（Core/Native Platform/iOS/macOS CI、macOS package）或 nightly 红时先修，修好前不合功能 PR（除非 `ci-red` issue 已确认无关）。开 PR 前查 `gh run list --branch develop --limit 10` 与 `gh issue list --label ci-red`，有红在正文写明红在哪及是否相关。见 [2026-10-28-ci-red-tracking.md](.agents/notes/implemented/process/2026-10-28-ci-red-tracking.md)。
+- **连着合几个 PR 时，逐个同步新 `develop` 等绿。** 后合 PR 若与刚合 PR 同改某平台或共享代码（`crates/`、`shared/`、`packages/`），先 `gh pr update-branch <n>` 再 `gh pr checks <n> --required --watch` 转绿再合；不相干平台可直合。见 [2026-10-30-push-and-merge-sequencing.md](.agents/notes/implemented/process/2026-10-30-push-and-merge-sequencing.md)。
+- **改文件读写、目录遍历、权限或安卓资源（drawable/主题/布局），合并前须过安卓模拟器。** 编译/lint/JVM 测不到 `/data` 权限、SELinux 硬链接与旧系统资源差异。本机跑 `bash platforms/android/tests/device/start-emulator.sh 28`（及 `35`），`MSIME_ANDROID_TEST_SERIAL=emulator-5566 bash platforms/android/tests/device/build-core-test.sh` 编 `client-{base,core,providers,services}` 单测，经 `run-core-test.sh` 与 `msime-engine` 词库租约单测上机跑通，再跑 `smoke.sh emulator-5566 --core`（API 35 不加 `--core`）。PR 上的 `android-device-pr` 仅在改键盘或设置界面时跑 API 35（见 [2026-10-28-android-device-on-ui-prs.md](.agents/notes/implemented/process/2026-10-28-android-device-on-ui-prs.md)），API 28 及其他改动仍靠本机。
+- **PR 截图一律上传 `sugi.moe` 嵌入正文。** 改任何可见内容须在「截图」节附真实尺寸与底色（含系统裁剪效果）的改前/改后图；未改视觉写「无」。用 `sugi up <图>`（`curl -fsSL https://sugi.moe/install.sh | bash` 或本机 `bin/sugi-upload`）或 `curl -F file=@<图> https://sugi.moe/api/upload`（每 IP 10 秒限 5 次，429 等 10 秒），贴前把 `https://files.sugi.moe/<id>.<ext>` 下载回验字节一致；不可用时退回 `files.catbox.moe` 直链，禁用 `tmpfiles.org`/`file.io` 等广告站。上传公开永久，禁含真实输入、账号、隐私、本机路径或凭据；保留本机原图。见 [2026-11-02-pr-images-on-sugi.md](.agents/notes/implemented/process/2026-11-02-pr-images-on-sugi.md)。
+- **不要把 Tauri 生成的工程当成某个平台的产品去启动、调试或验收。** 产品本体是 `platforms/<os>` 原生宿主（React 设置页仅用于 macOS/Linux Tauri 设置与 HarmonyOS ArkWeb rawfile，Windows 仅拉 Tauri 共享面板，iOS 与 Android 发布 APK 均不含，见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)）；`apps/desktop` 目录名与 Tauri bundle id 不构成例外。
+- **界面正在全部迁到原生，`packages/ui` 只修缺陷，不加新设置。** 新设置先把校验、默认值和业务规则写进共享 Rust（`client-{core,services,providers}`，经 `host-api`），再落原生设置；禁往 Tauri/React 加新页/面板/入口或新 WebView 宿主（顺序 Windows → macOS → HarmonyOS → Linux，见 [2026-11-03-all-native-ui.md](.agents/notes/proposed/architecture/2026-11-03-all-native-ui.md)）。
 
 ## 合并
 
-develop 的保护规则允许管理员绕过必过检查，自动合并流程又以管理员身份运行，所以下面这几条没有任何机器替你拦，只能靠合并的一方自己守住。
+`develop` 允许管理员绕过且自动合并以管理员运行，以下全靠合并方自守（详例见 [2026-11-02-merge-and-code-health-lessons.md](.agents/notes/implemented/process/2026-11-02-merge-and-code-health-lessons.md)）：
 
-- **必过检查和 `android-device-pr` 跑到终态成功之后才合并，不用管理员身份绕过保护规则先合。** 检查还在跑、`gh pr merge --admin` 和「先合了再看」都算绕过。PR 正文写「由 PR 上的设备 job 补跑」，那个 job 变绿之前不算验证过。2026-10-31 合并的 68 个 PR 里，9 个合并时必过检查还没出结果（#10386、#10394、#10401、#10419 的 iOS Simulator 事后失败），33 个合并时设备 job 没跑完、其中 20 个事后失败；#10394 新加的设备断言在任何设备上都过不了（ci-red #10442），后面排了 #10410、#10415、#10422、#10430、#10434 一串修复，develop 当天大半时间是红的。
-- **PR 正文自己写下的合并条件有约束力。** 正文写了「保持 draft 直到报告者确认」这类条件，或验证段列着「未完成」「未运行」的本地门禁，在条件兑现、或正文改写说明为什么不再需要之前不合并；不要把 draft 转成 ready 后立刻合。只是推测、没有复现的根因不进 develop。#10521 正文写着根因只是猜测、「keep as draft until the reporter confirms」，被转成 ready 17 秒后合并，猜的根因是错的，#10548 在虚拟机里复现后重修；#10417 验证段写着「剩余仓库检查……未完成」「未能运行 Vitest」就合了，隐藏设置组时把一个缺字段读作开启的开关一起藏了起来，鸿蒙手机上用户再也关不掉（#10427）。
-- **不要为了让新改动通过去改已有回归测试的前置条件。** 关开关、换默认值、换输入去绕开一条变红的旧回归测试，就是把它守着的那个 bug 放回来。确实要改，在正文单独说明旧前置条件为什么不再成立，并保留一条按出厂默认设置跑的用例。#10419 为了让 #8619 的回归测试通过，在测试里关掉了顶字，默认设置下 `guiyi`、`xiang` 又打不出来了，靠 #10425 修回。
-- **准备合并或开了 auto-merge 之后不再往分支上推；合并前核对 `gh pr view <n> --json headRefOid` 就是本地 `git rev-parse HEAD`。** 合并之后才推上去的提交不会进 develop，也不会有任何报错。#10206 合并后推上去的 `3ce6a537b7`、#9106 合并后推上去的两个 iOS 提交都这样静默丢了，几周后才由 #10320、#10322 找回。
-- **验证段写「交给 CI」之前，先确认 CI 真的执行那条测试。** `scripts/run-checks.sh` 的 `special_checks` 里由 `scripts/verify-local.sh` 负责的检查（`windows-native-run`、`windows-32bit-compile`、`harmony-settings-bundle`）只在本地门禁里跑，CI 不跑；Windows GNU 交叉编译作业只编译 `platforms/windows/tests/` 不运行。改了这些测试覆盖的行为，就在本机跑 `python3 scripts/test-windows-native-run.py` 这类入口，跑不了就写明「未验证」，不要写「交给 CI」。#10480 把五笔顶字改成立即上屏，改了 `wubi_commit_owner.cpp`，漏了断言同一件事的 `wubi_auto_commit.cpp`，验证段写「Windows 双会话测试……交给 CI」；CI 全绿合并，此后 develop 上每个人的本地门禁都红在这一条，直到 11-02 审计才被修掉。
+- **必过检查与 `android-device-pr` 终态成功后再合**，禁用 `gh pr merge --admin` 或先合再看；靠设备 job 补跑的 PR 在转绿前不算验证过。
+- **PR 正文自设的合并条件有约束力。** 写有「等报告者确认」或验证段含「未完成/未运行」本地门禁时，条件兑现或改写说明前禁合，禁转 ready 秒合；未复现的猜测根因不进 `develop`。
+- **不改已有回归测试前置条件迁就新改动。** 禁关开关、换默认值或换输入绕过红灯；确需改须在正文说明旧前提失效原因并保留出厂默认用例。
+- **准备合并或开 auto-merge 后不再推提交**；合前核对 `gh pr view <n> --json headRefOid` 等于本地 `git rev-parse HEAD`（见 [2026-10-30-push-and-merge-sequencing.md](.agents/notes/implemented/process/2026-10-30-push-and-merge-sequencing.md)）。
+- **验证段写「交给 CI」前确认 CI 真跑该项。** `scripts/run-checks.sh` 中归 `scripts/verify-local.sh` 的 `special_checks`（`windows-native-run`、`windows-32bit-compile`、`harmony-settings-bundle`）仅本地跑，Windows GNU 交叉编译只编不跑 `platforms/windows/tests/`；触及时本机跑 `python3 scripts/test-windows-native-run.py` 等，跑不了写「未验证」。
 
 ## 代码健康
 
-- **新的断言写成行为测试，不再往 `platforms/harmony/tests/run.sh` 和 `platforms/android/check-host.sh` 里加源码 grep。** 2026-10-26 到 11-02 一周，前者从 63 行涨到 951 行（385 条 `grep -q`，另有几十处用 `sed` 抠出函数体再 grep），后者从 1320 行涨到 2146 行。这类守卫钉的是源码的逐字文本，例如 `setTouchPoints\(imeTouchPoints\.pending, ...`：改名、换行、格式化就红，行为真坏了只要字符串还在照样绿，实际作用是阻止重构。新断言写进 JVM 冒烟、设备上的 `*DeviceSmoke` 或 `platforms/harmony/tests/*.test.ts`；改到某条旧守卫对应的代码时，顺手把那条换成行为测试或删掉。
-- **不再往巨型文件里加功能，新功能放进同目录的新文件。** 2026-11-02 时 `platforms/windows/settings/main.cpp` 约 2.8 万行，`KeyboardView.ets`、`MSIMEInputService.java`、`KeyboardViewController.swift` 各一万多行，`crates/engine/src/nine_key.rs` 近一万行，一周内各自又涨了一千到两千多行。改动落在这些文件里时，只放把新代码接进去的那几行，主体写成新文件（Windows 设置页照现有的 `*PageModel.h` 一页一个）；不要借机整体拆分，那是另一个需要单独授权的重构。
-- **运行时从本仓库分支拉取的文件不能当信任根。** develop 是自动合并的，任何从 `raw.githubusercontent.com/.../develop/...` 读的目录、配置或清单，内容都等于「最近一次合并的任意改动」。客户端必须在编译期把它能影响的东西钉死（来源主机和仓库、文件名、可接受的摘要），不能只校验格式。语法模型目录曾经只要求下载地址以 `https://` 开头、摘要也出自同一份目录，一次合并就能让所有客户端从任意主机下载 2 GiB 文件交给引擎加载；现在下载地址只接受编译期固定的上游 Release，见 `.agents/notes/implemented/feature/2026-10-26-grammar-model-local-snapshot.md`。
-
-见 `.agents/notes/implemented/process/2026-11-02-merge-and-code-health-lessons.md`。
+- **新断言写成行为测试，禁向 `platforms/harmony/tests/run.sh` 和 `platforms/android/check-host.sh` 加源码 `grep`。** 写进 JVM 冒烟、`*DeviceSmoke` 或 `platforms/harmony/tests/*.test.ts`；改到旧源码守卫涉及代码时顺手换为行为测试或删掉。
+- **不再往巨型文件里加功能，新功能放同目录新文件。** 触及 `platforms/windows/settings/main.cpp`、`KeyboardView.ets`、`MSIMEInputService.java`、`KeyboardViewController.swift`、`crates/engine/src/nine_key.rs` 等只留接线，主体进新文件（Windows 设置页按 `*PageModel.h` 分页）；未经单独授权不整体拆分。
+- **运行时从本仓分支拉取的文件不能当信任根。** `develop` 自动合并，客户端须在编译期钉死外部资源的主机、仓库、文件名与摘要（语法模型仅认编译期固定的上游 Release，见 [2026-10-26-grammar-model-local-snapshot.md](.agents/notes/implemented/feature/2026-10-26-grammar-model-local-snapshot.md)）。
 
 ## 界面
 
-- **避免冗余的文字说明。** 不加不必要的辅助标签、描述性文字和重复解释，优先通过视觉层级、内容分组、间距、对齐方式、字体排版以及清晰的控件名称，让界面本身传达结构和含义。
-- **每一段文字都要有存在的必要。** 加任何文字之前先问：它是否提供了必要信息，还是只在重复界面已经表达清楚的内容？
-- **优先改善布局，而不是增加解释。** 界面不够清晰时，先优化布局，不要用更多解释性文字去补。保持界面简洁、目的明确、视觉平衡。
-- **简洁不能牺牲易用性。** 必要的标签、无障碍设计、输入限制说明、错误提示，以及重要操作的确认信息都要保留，绝不为了追求极简而牺牲用户体验。
-- **设置项说明一律收进标题旁的「?」，全平台。** 六个平台的设置界面都不在页面上常驻解释性说明：设置项的解释进标题旁的「?」（桌面悬停或聚焦弹出、手机点按弹出），一组共用的解释进组标题旁的「?」；状态、当前值、校验和错误、条目元信息、前置条件、宿主限制、空列表提示和紧贴按钮讲后果的一句话留在原处。共享设置页用 `Row` 的 `description`（进「?」）和 `detail`（常驻），原生设置界面用各自的「?」组件。新增设置项或改界面时按这条写，不要在标题下面加一段灰字说明。规则全文和各平台落地见 [ARCHITECTURE.md](docs/ARCHITECTURE.md) 的「设置项说明收进「?」」。
-- **改界面要留图。** 改动前后的截图都留下，PR 的验证段写明截了哪些画面；验收用的截图不要随临时文件一起删掉。
+- **重布局少解释，不牺牲易用性。** 靠层级、分组、间距、对齐、排版与清晰控件名达意，不加冗余灰字；必要标签、无障碍、输入限制、错误提示与关键确认必留。
+- **设置项说明一律收进标题旁的「?」，全平台。** 六平台均不常驻灰字解释（单项进标题旁「?」，组进组标题旁「?」；状态、当前值、错误、元信息、前置条件、宿主限制、空列表提示及按钮旁后果一句留原处）。共享页分 `Row` 的 `description`（进「?」）与 `detail`（常驻），原生页用各自「?」组件，见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)「设置项说明收进「?」」。
+- **改界面要留图。** 保留改前/改后验收截图并在 PR 验证段列明，勿随临时文件删掉。
 
 ## 工具链
 
-- **Xcode 27 的模拟器界面是 `/Applications/Xcode.app/Contents/Applications/DeviceHub.app`，`Simulator.app` 已经不存在了。** `open -a Simulator` 和 `open -b com.apple.iphonesimulator` 都会失败，而 `xcrun simctl` 的 boot、install、launch、screenshot 全都照常工作——于是很容易把「窗口没出现」误判成「模拟器没起来」。设备真实状态以 `xcrun simctl list devices` 为准，要看画面才需要开 DeviceHub。
+- Xcode 27 模拟器界面为 `/Applications/Xcode.app/Contents/Applications/DeviceHub.app`（`Simulator.app` 已移除，`open -a Simulator` / `open -b com.apple.iphonesimulator` 必败），`xcrun simctl` 的 `boot`/`install`/`launch`/`screenshot` 照常；状态看 `xcrun simctl list devices`，看画面才开 DeviceHub。
 
 ## 本机安装
 
-- **维护者在开发机上说「安装」（「更新安装」「切到 develop 安装」同理），指的是整套安装，不是只换输入法。** 做法是用 `platforms/macos/package-release.sh` 从当前分支打出完整的包（设置应用 `MSIME.app`，内嵌输入法 `水杉输入法.app`、核心词库和 `msime-mcp`），备份后替换 `/Applications/MSIME.app`，打开一次让它装好内嵌的输入法，再确认设置应用和输入法报的版本都是 `platforms/macos/version.txt` 里的版本。签名用钥匙串里 Developer ID 的 SHA-1（`MACOS_SIGNING_IDENTITY`），`MSIME_SPARKLE_ROOT` 指向固定版本的 Sparkle；包是 universal 的，Rust 部分按两个架构各编一遍，开编前按下文「Worktree」一节先查磁盘。
-- 只跑 `platforms/macos/scripts/install.sh` 只换了输入法本体，设置应用和 `msime-mcp` 都还是旧的；`apps/desktop/src-tauri/tauri.conf.json` 的版本号也只在打包时被 `TAURI_CONFIG` 覆盖，不经打包构建出的设置应用一律报那个旧值。2026-10-19 连续几次「更新安装」都只换了输入法，用户打开的设置应用一直是 0.52.0，带着 develop 上早已修好的弹窗透底问题，版本号也对不上。
+- 维护者说「安装 / 更新安装 / 切到 develop 安装」指**整套打包安装**，禁只跑 `platforms/macos/scripts/install.sh`（会漏设置应用与 `msime-mcp` 且无 `TAURI_CONFIG` 版本覆盖，见 [2026-10-19-local-install-means-full-package.md](.agents/notes/implemented/process/2026-10-19-local-install-means-full-package.md)）。先按「Worktree」查磁盘，再用 `platforms/macos/package-release.sh`（配 `MACOS_SIGNING_IDENTITY` 与 `MSIME_SPARKLE_ROOT`，universal 双架构）打完整包，备份替换 `/Applications/MSIME.app`，启动一次装好内嵌 `水杉输入法.app`，确认两者版本均为 `platforms/macos/version.txt`。
 
 ## 语言
 
-本仓库的以下文本一律使用中文：
-
-- 代码注释：新增或修改的注释，包括 Rust、Swift、C++、Kotlin、ArkTS、TypeScript、Python 和脚本中的注释与文档注释。
-- Pull Request：标题和正文。
-- 评论：PR 评论、issue 评论，以及对他人评论的回复。
-- Code review：review 总结和每一条行内评论。
-
-说明：
-
-- 本规则优先于代理全局配置中「GitHub 上的文本用英文」之类的约定，只作用于本仓库。
-- 代码中的标识符、命令、路径、错误码、日志字段和接口字段保持原样，不翻译；中文句子里引用它们时用反引号括起来。
-- 修改已有的英文注释时，把改动到的那条注释改写成中文；不要为了改语言而批量重写没有改动的代码。
-- PR 标题保留英文的 Conventional Commits 类型前缀，冒号后面写中文，例如 `fix(linux): 焦点进入时显示当前输入模式`。前缀不能翻译：`pr-triage.yml` 的 Conventional title 检查只接受英文类型，squash 合并后标题成为 develop 上的提交标题，release-please 也靠前缀归类，因此更新日志会是中文摘要。
-- commit message 不在本规则范围内，格式见下一节。
+- 新增或修改的代码注释（Rust/Swift/C++/Kotlin/ArkTS/TS/Python/脚本）、PR 标题与正文、PR/issue 评论及回复、Code review 总结与行内评论**一律使用中文**（优先于全局英文约定）。
+- 标识符、命令、路径、错误码、日志与接口字段保原样加反引号；改到旧英文注释时顺手改中文，不批量重写未触及代码。
+- PR 标题保留英文 Conventional Commits 类型前缀、冒号后写中文（如 `fix(linux): 焦点进入时显示当前输入模式`，受 `pr-triage.yml` 与 `release-please` 约束）；commit message 见下节。
 
 ## 提交
 
-- 格式为 `type(scope): 摘要`，遵循 Conventional Commits。
-- 每个可独立验证的切片单独提交。
-- 不添加自动生成标记、AI 署名或 `Co-Authored-By` 水印。
+- 格式为 `type(scope): 摘要`（Conventional Commits）；每个可独立验证的切片单独提交；不添加自动生成标记、AI 署名或 `Co-Authored-By` 水印。
 
 ## 决策笔记
 
-非平凡改动必须带一篇笔记，写入 `.agents/notes/`；方法、格式与判定标准见 `.agents/skills/write-notes-like-deepseek/SKILL.md`。
-
-- 判定标准、目录结构（`{lifecycle}/{class}/yyyy-mm-dd-topic.md`）、文件格式以 SKILL.md 为准，本节只写仓库约定：笔记正文一律用简体中文；仓库 CI（`quality.yml`）跑同样的三条校验。
-- 动手前先检索旧笔记：`rg --hidden --glob '!.agents/notes/archived/**' "<关键词>" .agents/notes/`。有归属就地更新，不另起新篇；决定翻转才新建并互链。
-- 新想法先写 `proposed/`，落地随同代码改动转 `implemented/`；被否且值得记的进 `rejected/`。
-- 被放弃的方案先写它最强的理由，再解释为什么不用；确实没有真实备选时，`## Alternatives considered` 保留标题、正文写「无」，不要编造。
-- 提交前跑 `pnpm run verify-notes`，红了先修再交。机械性小改（样式、格式化、打标、不改行为的补丁）不写笔记，直接提交。
+- 非平凡改动须在 `.agents/notes/` 写简体中文笔记（结构 `{lifecycle}/{class}/yyyy-mm-dd-topic.md` 与格式见 [SKILL.md](.agents/skills/write-notes-like-deepseek/SKILL.md)，`quality.yml` 跑同款校验）；样式/格式化/打标等不改行为补丁免写。
+- 动手前搜 `rg --hidden --glob '!.agents/notes/archived/**' "<关键词>" .agents/notes/`：有归属就地更新，决定翻转才新建互链。新想法写 `proposed/`，落地随代码转 `implemented/`，被否且值得记进 `rejected/`。
+- 备选方案先写最强理由再写弃因；确无备选时保留 `## Alternatives considered` 标题并写「无」。提交前跑 `pnpm run verify-notes`。
 
 ## 发版
 
-- 打版本一律从 `develop` 新建 `release/<版本号>` 分支（例如 `release/0.51.0`），由这个分支向 `main` 开 PR。禁止直接从 `develop` 向 `main` 开 PR 或合并，`branch-guard.yml` 的 Base branch 检查会拒绝这种 PR。
-- 各平台版本号（`platforms/<os>/version.txt` 及随它一起改的文件，macOS 还有 `build-number.txt`）先经普通 PR 合入 `develop`，再从包含它的 `develop` 切 release 分支，让 `main` 上的版本号始终来自 `develop`。
-- release 分支合入 `main` 用 merge commit，不要 squash：squash 会让 `develop` 的提交不在 `main` 的祖先里，下一次发版会在双方各自新增过的文件上冲突。
-- 各平台的 Release 工作流按触发分支给发布加后缀：`main` 不加（`android-v0.1.4`），`develop` 加 `-beta`（`android-v0.1.4-beta`），其他分支加 `-alpha`。后缀只在 tag、标题和发布说明上，包内版本号仍是 `X.Y.Z`；带后缀的发布一律标为 prerelease，稳定版通道的应用内更新检查不会提供它（Windows、Linux、macOS 选了测试版或每日构建通道时提供 `-beta`、不提供 `-alpha`，见 `crates/client-services/src/update_check.rs`；Android 的预览版通道见 `UpdateApi.java`），Homebrew cask 和 Linux 发行版包定义也只在 `main` 的正式版之后更新。网页引擎只能从 `main` 发布，后缀只出现在其他分支的构建产物里。
-- Release Android 的 `publish` 依赖 `device` job（`android-device.yml`，API 28 和 35 模拟器上跑 client-base、client-core、client-providers 和 client-services 单测和装包验收），它不过就不发。不要为了赶发版把这个依赖去掉；它失败时先看上传的 logcat，确认是设备环境问题还是产品问题。
-- 网页引擎（Release Web Engine）勾选 `publish` 时只能在 `main` 上运行，workflow 会拒绝其他分支：它同时发布 npm 包 `@msime/web-engine`，npm 的 `latest` 会被接入方的版本范围和不带版本号的 CDN 地址自动取走。只构建不发布时任何分支都可以。
+- 先把 `platforms/<os>/version.txt`（macOS 含 `build-number.txt`）经普通 PR 合入 `develop`，再从 `develop` 切 `release/<版本号>` 向 `main` 开 PR（`branch-guard.yml` 禁 `develop` 直合 `main`），用 **merge commit** 合入（禁 squash，防下次发版冲突）。
+- 分支后缀：`main` 无后缀（正式版，更新 Homebrew cask 与 Linux 包定义），`develop` 加 `-beta`（测试版/每日构建通道提供，见 `crates/client-services/src/update_check.rs`、`UpdateApi.java`），其他分支加 `-alpha`（更新检查不推）；包内版本恒为 `X.Y.Z`，带后缀皆标 prerelease。
+- Release Android 的 `publish` 依赖 `android-device.yml`（API 28/35 模拟器单测与装包），失败查 logcat，禁删依赖。网页引擎（`@msime/web-engine`）勾选 `publish` 仅限 `main`（防污染 npm `latest` 与无版本 CDN；只构建不限分支）。
 
 ## Worktree
 
-本仓库以大量短生命周期的 worktree 开发，一个任务一个。它们积累得很快，而且每个都带着自己的构建产物，所以放在哪里和什么时候清理都很重要。
-
-- 一律建在仓库**外部**，放在 `~/worktrees/<feature>/` 或副盘上专门的 `worktrees/` 目录下。不要建在仓库内部、主工作区旁边或桌面上。
-- **不要用 `/tmp` 或 `/var/tmp`。** 那些目录归系统管，随时可能被清理，放在那里的未提交工作已经因此丢失过。
-- `<feature>` 用 kebab-case，从分支名或 issue 编号推出；不要加 `wt-` 前缀，父目录已经说明了它是什么。
-- 一路提交，不要把所有东西攒到最后。分支是第一道防线，目录只是第二道：一个 WIP 提交不花什么代价，却能扛住检出目录出的任何事。
-- **worktree 里不要重编没改过的那一半。** 新 worktree 的 `target/` 是空的，一次 Windows 客户端构建要从零编近 400 个 crate；而 Rust 那一半（三个架构的宿主 DLL、MCP server、Tauri 面板壳）不依赖原生代码，`Build-Client.ps1` 为此留了 `-RustOutputs <目录>`：指向已经编好的那一份，它一个 cargo 和 pnpm 命令都不跑，只编 C++（`release-windows.yml` 正是这样把一次 Rust 构建分给六个 edition）。所以改动只碰原生代码（TSF、Server、WinUI 设置）时，先在带着缓存的工作区把 Rust 产物编出来（`Build-RustOutputs.ps1 -Architecture x64|x86|arm64 -OutputDirectory <目录>`），再让 worktree 用 `-RustOutputs` 取。本机安装入口 `installer/test.ps1`、`test-light.ps1` 同样接受 `-RustOutputs`，原样交给 `Build-Client.ps1`。反过来，Rust 侧有改动时两边必须同源：Server 和 TSF 是同一次构建的协议对，新旧混用的后果不是报错而是行为错乱。2026-10-22 修一个只改了 TSF C++ 的缺陷，却让 worktree 从零编 390 个 crate，报出「要一个小时」才发现这件事本来二十几分钟就能做完。
-- 分支合并或废弃后立刻移除 worktree：`git worktree remove <path>`，然后 `git branch -D <branch>`。目录被手工删掉的话跑一次 `git worktree prune`。
-- **PR 合并后不要在原分支上继续提交或推送，下一项工作从 `origin/develop` 新切分支。** 仓库开着合并后自动删除 head 分支，但本地分支的 upstream 还指着它，再 `git push` 一次就会把它在远端重新建出来，还带着跟这个分支名无关的新提交。2026-10-06/07 两天 audit 留下的 31 个「PR 已合并却还在」的远端分支里，28 个都是这样：合并后几秒被 GitHub 删掉，几十秒后又被推了回来。关闭而不合并的 PR，GitHub 不会删它的分支，关的时候顺手 `git push origin --delete <branch>`。更糟的是这些提交本身不会进 develop：PR 已经合并，后推的提交没有任何 PR 带它们进去，分支被删后也没人看得见。所以**每次推送前先 `gh pr list --head <branch> --state all --json number,state` 看一眼**，PR 已经 MERGED 就从 `origin/develop` 新切分支，把提交 cherry-pick 过去另开 PR。#9106 开出 21 秒就合并了，之后推到分支上的 4 个 iOS 提交（弹窗贴合内容、语音入口），以及 #10206 合并后推上去的 1 个提交，直到 2026-10-30 逐个核对已合并 PR 的 head 才发现，分别由 #10322、#10324、#10320 补回。见 `.agents/notes/implemented/process/2026-10-30-push-and-merge-sequencing.md`。
-- **只用仓库规定的产物目录，不要自己另起 `CARGO_TARGET_DIR`。** 规定的目录是 `target/`，以及各平台脚本和 README 固定下来的 `target/<platform>-cargo`（`macos-cargo`、`android-cargo`、`ohos-cargo` 等）。原生工程的构建目录同理只用 README 和 `scripts/verify-local.sh` 固定的那一个：macOS 的 CMake 构建目录是 `target/macos-isolated`（`MSIME_MACOS_BUILD` 的默认值，`platforms/macos/README.md` 和 `launch-platform-host` skill 都用它）。它是 CMake 目录，不要拿它当 `CARGO_TARGET_DIR`，也不要在它旁边再另起一个 macOS 构建目录。每多一个目录，整棵依赖树就要从头再编一遍、再占几个 GB。2026-09-24 有一个 worktree 为不同平台和子任务分别建了 `build/rust-local-asr`、`build/macos-local-asr`、`build/tauri-local-asr`、`build/macos-crossfix`、`build/ios-local-asr`，单它一个就堆到 34 GB；另一个在 `target/macos-cargo` 旁边又建了 `target/macos-isolated`，比规定目录还大一倍。这类目录和另外五六个并行的 worktree 一起，一小时内把 461 GB 的盘写满了三次。产物目录里的东西坏了（典型是 `platforms/macos/README.md` 说的过程宏 dylib），删掉坏的那部分让它重编，不要换一个新目录绕开它。
-- **起新的构建之前先看本机磁盘还剩多少，不够就不要在本机编。** 一个 worktree 的第一次完整构建就要占 6–24 GB，几个会话同时在各自的 worktree 里起构建，盘会在一小时内被写满，写满之后所有会话的编译、测试和 git 操作一起失败，连带别的项目也停摆。动手前用 `df -h ~` 看剩余空间：低于 50 GB 时不要在本机起新的构建树，先清理自己留下的产物目录（按下文的检查确认没有别的会话在用），或者改用远端编译机（维护者机器上的远端编译方式见各自的全局规则），不要指望编到一半再说。2026-10-18 本机盘在几个小时里被并行的构建写满了三次，2026-10-19 又写到只剩 141 MB。清理别的 worktree 的产物时，`lsof +D` 和 `pgrep` 要查整个 worktree 目录，不能只查 `target/`：`scripts/verify-local.sh` 这类脚本是在 worktree 里以相对路径运行的，进程的命令行里不带 worktree 的路径，在两次编译步骤之间 `target/` 下也可能暂时没有打开的文件，只查 `target/` 会把正在跑的验证误判成空闲。
-
-清理不是可选的杂务。一个残留的 worktree 会让它完整的构建树一直活着——`target/`、`node_modules/` 和 `gradle-home/` 各自都是几个 GB——几十个被遗忘的 worktree 足以填满一块盘。
-
-删除前先确认安全：分支已并入 `develop`（是 `origin/develop` 的祖先，或者 `git cherry origin/develop <branch>` 报告每个提交都已应用），并且 `git status --porcelain` 没有已跟踪文件的修改。其它情况一律不动，可能还有别的会话在里面工作。
+- **位置与命名**：建在仓库外部 `~/worktrees/<feature>/` 或副盘 `worktrees/`（kebab-case，不加 `wt-` 前缀）；禁放仓内、主工作区旁、桌面或易被系统清理的 `/tmp`、`/var/tmp`。途中勤做 WIP 提交。
+- **Windows `-RustOutputs`**：新 worktree `target/` 为空，仅改原生代码（TSF/Server/WinUI 设置）时，先在有缓存区跑 `Build-RustOutputs.ps1 -Architecture x64|x86|arm64 -OutputDirectory <目录>`，再传 `-RustOutputs <目录>` 给 `Build-Client.ps1`、`installer/test.ps1` 或 `test-light.ps1` 免重编近 400 crate；改了 Rust 则 Server 与 TSF 必须同源重编，禁混用。
+- **推送前查 PR 状态**：合并后远端自动删分支，续推会重建死分支且提交静默丢在 `develop` 外。每次推送前跑 `gh pr list --head <branch> --state all --json number,state`；已 `MERGED` 则从 `origin/develop` 新切分支 cherry-pick 另开 PR；关而不合的 PR 顺手 `git push origin --delete <branch>`。见 [2026-10-30-push-and-merge-sequencing.md](.agents/notes/implemented/process/2026-10-30-push-and-merge-sequencing.md)。
+- **固定产物目录与磁盘水位（`>= 50 GB`）**：只用规定的 `target/`、`target/<platform>-cargo` 及固定原生构建目录（如 macOS CMake 目录 `target/macos-isolated`，勿作 `CARGO_TARGET_DIR` 或另起目录；产物坏了只删坏件重编，防多目录并行写满磁盘）。新起构建前跑 `df -h ~`，`< 50 GB` 禁在本机起新构建树（先清自有闲置产物或改走远端编译）。
+- **安全清理**：合并或废弃后即跑 `git worktree remove <path>` 与 `git branch -D <branch>`（手删目录补 `git worktree prune`）。清理前必查：①`lsof +D <worktree>` 与 `pgrep` 查**整个 worktree 目录**（禁只查 `target/`，相对路径脚本在编译间隙可能未打开 `target/` 文件）；②分支已并入 `origin/develop`（祖先或 `git cherry origin/develop <branch>` 全已应用）且 `git status --porcelain` 无已跟踪修改，否则不动。
