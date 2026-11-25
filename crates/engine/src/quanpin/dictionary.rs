@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::assets::{MAIN_DICTIONARY, NEURAL_MODEL_KEYBOARD, USER_JOURNAL};
 use crate::cache::FifoCache;
+use crate::dictionary::english::EnglishDictionary;
 use crate::dictionary::pinyin::{PinyinDatabase, INSERTED_WEIGHT};
 use crate::dictionary::DictRow;
 use crate::error::{EngineError, Result};
@@ -19,7 +20,7 @@ use crate::ime::online_batch::{
 };
 use crate::lattice::decode::{
     decode_pinned, BeamPrefixCache, BeamResume, BigramMemo, PinnedSpan, SentenceNgramTables,
-    SENTENCE_PATHS,
+    TypoSentence, SENTENCE_PATHS,
 };
 use crate::lattice::merge::{
     decode_lattice, decode_lattice_borrowed, merge_decoded, merge_decoded_borrowed,
@@ -284,6 +285,8 @@ pub struct QuanpinDictionary {
     /// 每条切分至少解出几条整句读法，0 为默认的 [`SENTENCE_PATHS`]；宿主挂了逐键打分器时由 runtime 经 `QueryRequest::sentence_pool` 给出。
     sentence_pool: usize,
     sentence_association: SentenceAssociationOptions,
+    english_mixed_candidates: bool,
+    english_dictionary: Option<EnglishDictionary>,
     /// 首页放得下几行，决定全长组的补全词是按权重并进来还是接在整组末尾；来自宿主的每页候选数（`QueryRequest::first_page_rows`）。存成 `FirstPageRows` 是为了让 0 在这里没有入口，全拼和九键的「0 当 1」只在 `FirstPageRows::new` 做一次。
     first_page_rows: FirstPageRows,
     rescoring_context: String,
@@ -352,6 +355,8 @@ impl QuanpinDictionary {
             sentence_alternatives: false,
             sentence_pool: 0,
             sentence_association: SentenceAssociationOptions::default(),
+            english_mixed_candidates: false,
+            english_dictionary: None,
             first_page_rows: FirstPageRows::default(),
             rescoring_context: String::new(),
             pinyin_segmentation: String::new(),
@@ -398,6 +403,9 @@ impl QuanpinDictionary {
             ) {
                 lead_literal_abbreviation_phrases(&mut result, raw, self.abbreviation_kept_seat());
             }
+        }
+        if self.english_mixed_candidates && !raw.is_empty() {
+            self.inject_mixed_english(raw, &mut result);
         }
         // Marking runs after every change, including the fuzzy merge, so every row the caller sees carries its mark.
         mark_autocorrect_candidates(
@@ -852,6 +860,14 @@ impl QuanpinDictionary {
         self.series_cache.clear();
     }
 
+    pub fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        if self.english_mixed_candidates == enabled {
+            return;
+        }
+        self.english_mixed_candidates = enabled;
+        self.series_cache.clear();
+    }
+
     /// 全辅音输入里原来打头的纠错候选最多退到的座位：首页最后一个，最小为 1（`lead_literal_abbreviation_phrases`）。
     fn abbreviation_kept_seat(&self) -> usize {
         self.first_page_rows.get().saturating_sub(1).max(1)
@@ -1218,6 +1234,14 @@ impl QuanpinDictionary {
                 types,
                 &mut result,
             );
+            if segments.len() >= 4 {
+                demote_compound_phrase_extensions(
+                    &mut result,
+                    primary_segmentation,
+                    segments.len(),
+                    raw.len(),
+                );
+            }
         }
         let (cached, projected) = match cold {
             ColdRows::Transfer => {
@@ -1260,6 +1284,28 @@ impl QuanpinDictionary {
             self.remember_personal_scored_key(slot);
         }
         projected
+    }
+
+    fn inject_mixed_english(&mut self, raw: &str, result: &mut Vec<WordItem>) {
+        if !self.english_mixed_candidates || !self.sentence_association.word_lattice {
+            return;
+        }
+        let paths = &self.paths;
+        let english_dict = self.english_dictionary.get_or_insert_with(|| {
+            EnglishDictionary::open(
+                &paths.dictionary(crate::assets::ENGLISH_DICTIONARY),
+                Some(&paths.resource(crate::assets::TRANSLATIONS)),
+                Some(&paths.user(crate::assets::LEARNED_GLOSSES)),
+            )
+        });
+        let options = self.sentence_tables.options(self.sentence_alternatives);
+        let mixed = crate::lattice::mixed_english::decode_mixed_english_quanpin(
+            raw,
+            &self.database,
+            Some(english_dict),
+            &options,
+        );
+        crate::lattice::mixed_english::merge_mixed_english_candidates(result, mixed);
     }
 
     fn rescue_two_syllable_touch_typo(
@@ -1496,6 +1542,13 @@ impl QuanpinDictionary {
         }
         if !supplemental.is_empty() {
             merge_series_by_coverage(&mut result, supplemental);
+            if primary_segments.len() >= 5 {
+                rank_equal_syllable_literal_sentences(
+                    &mut result,
+                    raw.len(),
+                    primary_segments.len(),
+                );
+            }
             if self.sentence_pool > SENTENCE_PATHS {
                 defer_pooled_sentences(&mut result, raw, SENTENCE_PATHS);
             }
@@ -1963,7 +2016,15 @@ impl QuanpinDictionary {
         } else {
             (false, false)
         };
-        if confident {
+        let neighbor_slip_leads = touched_slice.is_none()
+            && !raw.is_empty()
+            && !raw.contains('\'')
+            && self.key_geometry.is_none()
+            && at == 0
+            && result.first().is_some_and(|literal| {
+                quanpin_neighbor_slip_leads(&self.database, segments, literal, &typo)
+            });
+        if confident || neighbor_slip_leads {
             at = 0;
         } else if !typo.leads(options.typo_lead_margin) {
             if (typo.leads(TYPO_SECOND_SEAT_MARGIN) || touch_supported)
@@ -2857,6 +2918,16 @@ fn alternative_segmentations(
         for cut in cut_pinyin_by_mode(raw, CutMode::Correction) {
             append(cut);
         }
+    } else if !raw.contains('\'')
+        && segments.len() > MAX_SYLLABLES_FOR_MULTIPLE_SEGMENTATIONS
+        && has_only_complete_pinyin_segments(segments)
+    {
+        // 长句超过全图枚举上限时，仍保留同音节数的字面重切（如 `fan'gan` 与 `fang'an`），不放开跨音节数的纠错切分。
+        for cut in cut_pinyin_by_mode(raw, CutMode::Correction) {
+            if cut.len() == segments.len() && is_literal_segmentation(raw, &cut) {
+                append(cut);
+            }
+        }
     }
     if !raw.contains('\'')
         && segments.len() <= MAX_SYLLABLES_FOR_MULTIPLE_SEGMENTATIONS
@@ -2903,6 +2974,223 @@ fn is_literal_segmentation(raw: &str, segments: &[String]) -> bool {
 /// Letters of a row's matched code, what the fuzzy merge sorts by.
 fn matched_letters(pinyin: &str) -> usize {
     pinyin.bytes().filter(|&byte| byte != b'\'').count()
+}
+
+fn syllable_count(pinyin: &str) -> usize {
+    if pinyin.is_empty() {
+        0
+    } else {
+        pinyin.bytes().filter(|&byte| byte == b'\'').count() + 1
+    }
+}
+
+fn rank_equal_syllable_literal_sentences(
+    result: &mut [WordItem],
+    full_letters: usize,
+    primary_syllables: usize,
+) {
+    let bucket_len = result
+        .iter()
+        .take_while(|item| matched_letters(&item.pinyin) == full_letters)
+        .count();
+    let is_target = |item: &WordItem| {
+        item.source == CandidateSource::Generated
+            && item.sentence_association
+            && item.corrected_from.is_empty()
+            && !item.fuzzy
+            && syllable_count(&item.canonical_pinyin) == primary_syllables
+    };
+    for i in 1..bucket_len {
+        if !is_target(&result[i]) {
+            continue;
+        }
+        let mut cur = i;
+        for prev in (0..i).rev() {
+            if !is_target(&result[prev]) {
+                continue;
+            }
+            if result[prev].weight < result[cur].weight {
+                result.swap(prev, cur);
+                cur = prev;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn same_row_horizontal_neighbors(left: u8, right: u8) -> bool {
+    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
+    if left == right {
+        return false;
+    }
+    for row in ROWS {
+        if let (Some(li), Some(ri)) = (
+            row.iter().position(|&b| b == left),
+            row.iter().position(|&b| b == right),
+        ) {
+            return li.abs_diff(ri) == 1;
+        }
+    }
+    false
+}
+
+/// 无触点全拼下，单处同行水平邻键滑音（如 `f`/`g`、`g`/`h`）若把碎裂字面串恢复为全多字高频词句，允许升至首位。
+fn quanpin_neighbor_slip_leads(
+    database: &PinyinDatabase,
+    segments: &[String],
+    literal: &WordItem,
+    typo: &TypoSentence,
+) -> bool {
+    if !literal.sentence_association
+        || typo.edges != 1
+        || typo.words.len() < 2
+        || !typo.words.iter().all(|word| count_han_chars(word) >= 2)
+    {
+        return false;
+    }
+    let typo_segments = split_segments(&typo.key);
+    if typo_segments.len() != segments.len() {
+        return false;
+    }
+    let mut diff_syllable = None;
+    for (idx, (lit_seg, corr_seg)) in segments.iter().zip(&typo_segments).enumerate() {
+        if lit_seg == corr_seg {
+            continue;
+        }
+        if diff_syllable.is_some() || lit_seg.len() != corr_seg.len() {
+            return false;
+        }
+        let mut byte_diff = None;
+        for (b_idx, (&lb, &cb)) in lit_seg
+            .as_bytes()
+            .iter()
+            .zip(corr_seg.as_bytes())
+            .enumerate()
+        {
+            if lb == cb {
+                continue;
+            }
+            if byte_diff.is_some() || b_idx != 0 || !same_row_horizontal_neighbors(lb, cb) {
+                return false;
+            }
+            byte_diff = Some((lb, cb));
+        }
+        if byte_diff.is_none() {
+            return false;
+        }
+        diff_syllable = Some(idx);
+    }
+    let Some(diff_idx) = diff_syllable else {
+        return false;
+    };
+    if typo.words.len() < literal.sentence_words.len() {
+        return typo.leads(TYPO_SECOND_SEAT_MARGIN);
+    }
+    if typo.words.len() == literal.sentence_words.len() && typo.score > typo.literal_score + 2.0 {
+        let total_chars: usize = typo.words.iter().map(|word| count_han_chars(word)).sum();
+        if total_chars != typo_segments.len() {
+            return false;
+        }
+        let mut start = 0usize;
+        for word in &typo.words {
+            let end = start + count_han_chars(word);
+            if (start..end).contains(&diff_idx) {
+                let w_corr = database
+                    .query_lattice_span(&typo_segments[start..end], 1)
+                    .first()
+                    .map_or(0, |row| row.weight.max(0));
+                let w_lit = database
+                    .query_lattice_span(&segments[start..end], 1)
+                    .first()
+                    .map_or(0, |row| row.weight.max(0));
+                return w_corr >= 1_000_000 && w_corr >= w_lit.max(1).saturating_mul(100);
+            }
+            start = end;
+        }
+    }
+    false
+}
+
+/// 四音节及以上输入已有精确整词命中时，把未请求的长词补全与拆韵母多出的高音节整句排到多音节前缀词之后，保住第二三位给精确同音词与主前缀词。
+fn demote_compound_phrase_extensions(
+    result: &mut [WordItem],
+    primary_segmentation: &str,
+    primary_syllables: usize,
+    full_letters: usize,
+) {
+    let has_exact_primary = result.first().is_some_and(|item| {
+        item.source.is_dictionary()
+            && !item.fuzzy
+            && item.corrected_from.is_empty()
+            && item.canonical_pinyin == primary_segmentation
+    });
+    if !has_exact_primary {
+        return;
+    }
+    let is_longer_or_split = |item: &WordItem| {
+        let longer_completion = item.source.is_dictionary()
+            && matched_letters(&item.pinyin) == full_letters
+            && item
+                .canonical_pinyin
+                .strip_prefix(item.pinyin.as_str())
+                .is_some_and(|rest| rest.starts_with('\''));
+        let split_sentence = item.source == CandidateSource::Generated
+            && item.sentence_association
+            && item.corrected_from.is_empty()
+            && syllable_count(&item.canonical_pinyin) > primary_syllables;
+        longer_completion || split_sentence
+    };
+    let is_equal_generated = |item: &WordItem| {
+        item.source == CandidateSource::Generated
+            && item.sentence_association
+            && item.corrected_from.is_empty()
+            && syllable_count(&item.canonical_pinyin) == primary_syllables
+    };
+    let split_index = result
+        .iter()
+        .position(|item| {
+            !is_longer_or_split(item)
+                && matched_letters(&item.pinyin) < full_letters
+                && syllable_count(&item.pinyin) <= 1
+        })
+        .unwrap_or(result.len());
+    let equal_generated_count = result[..split_index]
+        .iter()
+        .filter(|item| is_equal_generated(item))
+        .count();
+    if !result[..split_index].iter().any(is_longer_or_split) && equal_generated_count <= 1 {
+        return;
+    }
+    let has_multi_syllable_prefix = result[..split_index].iter().any(|item| {
+        !is_longer_or_split(item)
+            && matched_letters(&item.pinyin) < full_letters
+            && syllable_count(&item.pinyin) >= 2
+    });
+    let has_exact_homophone = result[1..split_index].iter().any(|item| {
+        !is_longer_or_split(item)
+            && !is_equal_generated(item)
+            && matched_letters(&item.pinyin) == full_letters
+    });
+    if !has_multi_syllable_prefix && !has_exact_homophone {
+        return;
+    }
+    let mut kept_equal_generated = 0usize;
+    let mut deferred_flags = Vec::with_capacity(split_index);
+    for item in &result[..split_index] {
+        if is_longer_or_split(item) {
+            deferred_flags.push(true);
+        } else if is_equal_generated(item) {
+            kept_equal_generated += 1;
+            deferred_flags.push(kept_equal_generated > 1);
+        } else {
+            deferred_flags.push(false);
+        }
+    }
+    let mut indices: Vec<usize> = (0..split_index).collect();
+    indices.sort_by_key(|&idx| deferred_flags[idx]);
+    let reordered: Vec<WordItem> = indices.into_iter().map(|idx| result[idx].clone()).collect();
+    result[..split_index].clone_from_slice(&reordered);
 }
 
 /// 整句只按原拼音解码，`whole_sentence_insert_position` 把它放在原拼音覆盖整个输入的词库行之后；它排到首位，通常是因为原拼音没有这样的词，这时它只是替补。开了模糊音，按模糊读法覆盖整个输入的词库行就是这个输入的整词，替补要让给它：`zongguo` 开 z=zh 时「中国」排到整句「总国」前面。同一档里只要还有原拼音覆盖整个输入的精确词库行（整词、另一种切分的整词，哪怕排在更长的补全词后面），就一行也不动，精确仍先于模糊；补全出的更长词条不算覆盖。挪动只在覆盖整个输入的那一档里做，模糊行之间、其余行之间的先后都不变。不开模糊音时不经过这里。

@@ -524,6 +524,13 @@ impl ShuangpinEngine {
         self.dictionary
             .set_autocorrect_types(request_autocorrect_types(request));
         self.dictionary.set_fuzzy_pinyin(request.fuzzy_pinyin);
+        let explicit_helpcode_trigger = !request.end_helpcodes.is_empty()
+            || !request.raw_input_with_helpcode_marks.is_empty()
+            || (!request.raw_input_with_cases.is_empty()
+                && request.raw_input_with_cases != request.raw_input);
+        self.dictionary.set_english_mixed_candidates(
+            request.english_mixed_candidates && !explicit_helpcode_trigger,
+        );
 
         let raw = &request.raw_input;
         if raw.bytes().all(|byte| byte == b'\'') {
@@ -640,13 +647,17 @@ impl ShuangpinEngine {
                 &helpcode.help_codes,
                 keymap,
             );
-            self.append_fuzzy(
+            let mut rows = self.append_fuzzy(
                 exact,
                 &helpcode.base_segmentation,
                 request.fuzzy_pinyin,
                 &helpcode.help_codes,
                 keymap,
-            )
+            );
+            if !explicit_helpcode_trigger && !raw.contains('\'') {
+                self.dictionary.inject_mixed_english(raw, &mut rows);
+            }
+            rows
         } else {
             let segmentation = segment_input(raw, self.profile);
             let exact =

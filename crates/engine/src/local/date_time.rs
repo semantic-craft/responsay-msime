@@ -368,6 +368,9 @@ fn relative_day_labels(label: &str, now: &LocalDateTime) -> [String; 3] {
     ]
 }
 
+/// 锚定词在简拼同音列表里排得太靠后（如 `xq` 下「星期」落在第 13 位）时，提到第二位，保住首屏能直接看见星期和日期行，同时不抢首选字面高频词。
+const INLINE_ANCHOR_KEEP_THRESHOLD: usize = 3;
+
 /// 把 `kind` 的几行接在第一个锚定词候选后面，`pinyin` 是选中它们时吃掉的整段组字。候选里没有锚定词时不加，也不读时钟。新加的行是 `Generated` 且没有规范读音，上屏时不进词库、不记个人上下文；列表里已有同样文字的行时挪那一行，不重复。
 /// `menu_keyword` 给「📅日期」入口的关键词（`utility.date_time_menu`）：有行可跟时把入口放在第一行后面——锚定词在首位时正好是参考的第三位；一行都没有（农历换算不出来）时不放入口。入口的 `pinyin` 用 `menu:` 前缀记关键词而不是组字，选中它不会上屏。
 pub(crate) fn insert_inline_date_time(
@@ -378,12 +381,21 @@ pub(crate) fn insert_inline_date_time(
     now: impl FnOnce() -> LocalDateTime,
     menu_keyword: Option<&str>,
 ) {
-    let Some(position) = candidates.iter().position(|item| item.word == anchor) else {
+    let Some(mut position) = candidates.iter().position(|item| item.word == anchor) else {
         return;
     };
+    let rows = inline_date_time_rows(kind, &now());
+    if rows.is_empty() {
+        return;
+    }
+    if position > INLINE_ANCHOR_KEEP_THRESHOLD {
+        let anchor_row = candidates.remove(position);
+        position = 1.min(candidates.len());
+        candidates.insert(position, anchor_row);
+    }
     let weight = candidates[position].weight;
     let mut at = position + 1;
-    for text in inline_date_time_rows(kind, &now()) {
+    for text in rows {
         match candidates.iter().position(|item| item.word == text) {
             // 词库里本来就有这一行（`xingqi` 下的 星期六）：已经排在锚定词前面就不动，在后面就挪上来，仍是词库行，选中照常调频。
             Some(existing) if existing < at => continue,
@@ -875,6 +887,30 @@ mod tests {
             None,
         );
         assert_eq!(without_anchor.len(), 1);
+
+        let xq_row = |word: &str| WordItem::new("x'q", word, 10, CandidateSource::Database, "x'q");
+        let mut buried = vec![
+            xq_row("需求"),
+            xq_row("下去"),
+            xq_row("兴趣"),
+            xq_row("心情"),
+            xq_row("小区"),
+            xq_row("星期"),
+            xq_row("学期"),
+        ];
+        insert_inline_date_time(
+            &mut buried,
+            "星期",
+            InlineDateTime::Week,
+            "xq",
+            sample_time,
+            Some("xq"),
+        );
+        let buried_words: Vec<&str> = buried.iter().map(|item| item.word.as_str()).collect();
+        assert_eq!(
+            &buried_words[..5],
+            ["需求", "星期", "星期日", "📅星期", "周日"]
+        );
     }
 
     /// `utility.date_time_menu`：入口跟在第一条行内日期时间行后面（锚定词在首位时即参考的第三位），`pinyin` 用 `menu:` 前缀记关键词、不是组字，选中不上屏。

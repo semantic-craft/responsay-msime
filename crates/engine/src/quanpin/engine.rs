@@ -69,6 +69,8 @@ impl QuanpinEngine {
         } else {
             0
         };
+        self.dictionary
+            .set_english_mixed_candidates(request.english_mixed_candidates && helpcode_length == 0);
         if helpcode_length == 0 {
             self.set_key_touches(request);
             return self.dictionary.query(
@@ -154,6 +156,8 @@ impl QuanpinEngine {
         } else {
             0
         };
+        self.dictionary
+            .set_english_mixed_candidates(request.english_mixed_candidates && helpcode_length == 0);
         if helpcode_length == 0 {
             self.set_key_touches(request);
         } else {

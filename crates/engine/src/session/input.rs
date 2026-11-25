@@ -312,6 +312,9 @@ impl InputSession {
         session.frequency = options.frequency;
         session.mixed_candidates_enabled = options.mixed_candidates;
         session.english_options = options.english;
+        session.engine.set_english_mixed_candidates(
+            options.mixed_candidates && options.english.mixed_candidates,
+        );
         session.set_local_mode_options(options.local_modes);
         session.queries.set_command_table(&options.command_table);
         session
@@ -2145,7 +2148,15 @@ impl InputSession {
             return;
         }
         self.english_options.mixed_candidates = enabled;
-        self.update_mixed_candidates();
+        self.engine
+            .set_english_mixed_candidates(self.mixed_candidates_enabled && enabled);
+        if self.has_composition() {
+            self.prefix_query_input.clear();
+            self.recompute_candidates();
+            self.invalidate_online_requests();
+        } else {
+            self.update_mixed_candidates();
+        }
     }
 
     fn set_quanpin_helpcode_enabled(&mut self, enabled: bool) {

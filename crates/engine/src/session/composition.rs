@@ -318,6 +318,12 @@ impl InputSession {
             let base = resolve_shuangpin_composition_base(request, self.shuangpin_profile());
             let word_length = count_han_chars(&selected.word) * 2;
             let total = base.effective_raw_input.len();
+            if selected.source == CandidateSource::Generated
+                && selected.canonical_pinyin.is_empty()
+                && remove_delimiters(&selected.pinyin).len() >= total
+            {
+                return true;
+            }
             if base.helpcode_length > 0 {
                 let required = word_length + base.helpcode_length;
                 return !(required < total && word_length < total);

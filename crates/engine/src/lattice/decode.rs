@@ -352,17 +352,18 @@ impl TypoSentence {
 /// 2026-11-03 在 typing-chat-v1 dev、sentences-neutral-v1、sentences-v2 上扫 0、8、14、20（只用引擎，和 6x256 配 32 条两组），8 是三个集合都不变差的最大值：再大，「贯彻得」这类「得」会变成「的」。没参与调参的 typing-chat test、sentences-v1、语气词集上，两组合计改对 11、改错 0。见 `.agents/notes/implemented/feature/2026-11-03-function-word-bonus.md`。
 pub const FUNCTION_WORD_BONUS: f64 = 8.0;
 
-/// 读轻声的结构助词和时态助词，连同它们在这里的读音。
+/// 读轻声的结构助词、时态助词与句中祈使引词，连同它们在这里的读音。
 const FUNCTION_WORDS: &[(char, &str)] = &[
     ('的', "de"),
     ('地', "de"),
     ('得', "de"),
     ('了', "le"),
     ('着', "zhe"),
+    ('请', "qing"),
 ];
 
 /// 单字助词那条边的加分 [`FUNCTION_WORD_BONUS`]，其余为 0。读音要对得上：「了」读 liao、「着」读 zhao、「的」读 di 时不是助词。
-fn function_word_bonus(word: &str, span: &[String]) -> f64 {
+pub(super) fn function_word_bonus(word: &str, span: &[String]) -> f64 {
     let mut chars = word.chars();
     let single = match (chars.next(), chars.next(), span) {
         (Some(c), None, [reading]) => FUNCTION_WORDS.iter().any(|&(f, r)| f == c && r == reading),
@@ -373,6 +374,155 @@ fn function_word_bonus(word: &str, span: &[String]) -> f64 {
     } else {
         0.0
     }
+}
+
+/// 书面百科二元表缺省的口语时间搭配（如「早上 + 九点 + 开会」）与「指代/动量 + 个 + 双字名物」（如「发个 + 位置」「这个 + 项目」），仅在静态二元未给出正加分时补齐口语转移强度。
+pub(super) fn colloquial_transition_bonus(
+    previous: &str,
+    next: &str,
+    effective_static: f64,
+) -> f64 {
+    if effective_static > 0.0 {
+        return 0.0;
+    }
+    if is_day_period(previous) && is_spoken_clock_hour(next) {
+        return 2.8;
+    }
+    if is_spoken_clock_hour(previous) && is_scheduled_action(next) {
+        return 1.5;
+    }
+    if is_ge_determiner_or_verb(previous) && is_concrete_multi_char_noun(next) {
+        return 2.5;
+    }
+    0.0
+}
+
+fn is_day_period(word: &str) -> bool {
+    matches!(
+        word,
+        "早上"
+            | "上午"
+            | "中午"
+            | "下午"
+            | "晚上"
+            | "凌晨"
+            | "傍晚"
+            | "今晚"
+            | "明早"
+            | "今早"
+            | "今天"
+            | "明天"
+            | "昨天"
+            | "后天"
+            | "每天"
+    )
+}
+
+fn is_spoken_clock_hour(word: &str) -> bool {
+    matches!(
+        word,
+        "一点"
+            | "两点"
+            | "三点"
+            | "四点"
+            | "五点"
+            | "六点"
+            | "七点"
+            | "八点"
+            | "九点"
+            | "十点"
+            | "十一点"
+            | "十二点"
+            | "一点半"
+            | "两点半"
+            | "三点半"
+            | "四点半"
+            | "五点半"
+            | "六点半"
+            | "七点半"
+            | "八点半"
+            | "九点半"
+            | "十点半"
+            | "十一点半"
+            | "十二点半"
+    )
+}
+
+fn is_scheduled_action(word: &str) -> bool {
+    matches!(
+        word,
+        "开会"
+            | "上班"
+            | "下班"
+            | "上课"
+            | "下课"
+            | "出发"
+            | "起床"
+            | "睡觉"
+            | "见面"
+            | "开始"
+            | "结束"
+            | "左右"
+            | "见"
+            | "整"
+    )
+}
+
+fn is_ge_determiner_or_verb(word: &str) -> bool {
+    matches!(
+        word,
+        "这个"
+            | "那个"
+            | "哪个"
+            | "每个"
+            | "发个"
+            | "看个"
+            | "买个"
+            | "找个"
+            | "换个"
+            | "定个"
+            | "给个"
+            | "留个"
+            | "打个"
+            | "拍个"
+            | "建个"
+            | "写个"
+            | "做个"
+    )
+}
+
+fn is_concrete_multi_char_noun(word: &str) -> bool {
+    let mut chars = word.chars();
+    if chars.next().is_none() || chars.next().is_none() {
+        return false;
+    }
+    !matches!(
+        word,
+        "我们"
+            | "你们"
+            | "他们"
+            | "她们"
+            | "自己"
+            | "大家"
+            | "之前"
+            | "以前"
+            | "以后"
+            | "之后"
+            | "刚才"
+            | "昨天"
+            | "今天"
+            | "明天"
+            | "去年"
+            | "今年"
+            | "其他"
+            | "别的"
+            | "有关"
+            | "无关"
+            | "一样"
+            | "不同"
+            | "相似"
+            | "相反"
+    )
 }
 
 /// 单字权重按语料计数归一；多字词按音节奖励，并为每次插入扣一份奖励，避免拆成更多词组额外赚取正的词频分。
@@ -1310,15 +1460,13 @@ fn decode_graph_with_terminal<const WIDE_TERMINAL: bool>(
                 &bigram_rows[row]
             });
             // 前驱列已经剪枝且不会再改变；前驱列为零时没有更早的词，起点也填零。
-            let context = personal.map(|personal| {
-                let earlier = match hyp.prev {
-                    (column, at) if column > 0 => {
-                        done[column].hyps[at].edge.map(|edge| edge.word.as_str())
-                    }
-                    _ => None,
-                };
-                personal.context(earlier, Some(previous))
-            });
+            let earlier_word = match hyp.prev {
+                (column, at) if column > 0 => {
+                    done[column].hyps[at].edge.map(|edge| edge.word.as_str())
+                }
+                _ => None,
+            };
+            let context = personal.map(|personal| personal.context(earlier_word, Some(previous)));
             // 同一假设的出边共享上下文；空列或搭配停用时不回溯。
             let prepared_tail = collocation
                 .filter(|_| outgoing_len != 0)
@@ -1342,10 +1490,22 @@ fn decode_graph_with_terminal<const WIDE_TERMINAL: bool>(
                     score -= SENTENCE_OPENING_PARTICLE_PENALTY;
                 }
                 let static_bonus = bonuses.map_or(0.0, |bonuses| f64::from(bonuses[at]));
+                let mut effective_static = static_bonus.max(0.0);
+                // 句中结句助词「了」会截断前后分句（「变冷了 | 注意保暖」），没有三元共现确认时不继承书面固定搭配「改了主意」的二元加分。
+                if effective_static > 0.0 && previous == "了" {
+                    if let (Some(earlier), Some(trigram)) =
+                        (earlier_word, options.trigram.as_deref())
+                    {
+                        if trigram.trigram(earlier, previous, &edge.word) <= 0.0 {
+                            effective_static = 0.0;
+                        }
+                    }
+                }
                 if bigram.is_some() {
                     // Only a pair the table favours moves the path. A pair it calls less likely than chance counts the same as one it never kept: the table drops rare pairs, so an absent pair is usually rarer still, and penalising the observed one made a common word lose to a rarer one with no pair at all. 句首→一大 is -1.0 and 句首→益达 is absent, which put 益达拖 ahead of 一大拖 for yidatuo (#7583).
-                    score += options.bigram_weight * static_bonus.max(0.0);
+                    score += options.bigram_weight * effective_static;
                 }
+                score += colloquial_transition_bonus(previous, &edge.word, effective_static);
                 if let (Some(personal), Some(context)) = (personal, context.as_ref()) {
                     if context.confidence > 0.0 {
                         score += personal_transition(

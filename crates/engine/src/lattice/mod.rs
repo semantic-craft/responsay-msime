@@ -3,6 +3,7 @@
 mod cxx_sort;
 pub mod decode;
 pub mod merge;
+pub mod mixed_english;
 pub mod neural;
 pub mod ngram;
 pub mod octagram;

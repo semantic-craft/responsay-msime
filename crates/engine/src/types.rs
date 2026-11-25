@@ -1106,6 +1106,8 @@ pub struct QueryRequest {
     pub key_geometry: Option<std::sync::Arc<crate::touch::KeyGeometry>>,
     /// 按触点计价的参数。只有 Rust 侧（评测示例）能改，见 [`crate::host::Session::set_touch_tuning`]。
     pub touch_tuning: crate::touch::TouchTuning,
+    /// 是否启用句中无缝中英混输词网格注入（跟随 `SessionOptions::mixed_candidates && SessionOptions::english.mixed_candidates`）。
+    pub english_mixed_candidates: bool,
     /// False means no query at all.
     pub valid: bool,
 }

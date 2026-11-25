@@ -112,6 +112,7 @@ pub struct ImeSession {
     /// 首页行数随每个请求交给各方案引擎；只影响词库要不要并入补全词。
     first_page_rows: FirstPageRows,
     sentence_association: SentenceAssociationOptions,
+    english_mixed_candidates: bool,
     rescoring_context: String,
     typo_profile: Arc<PersonalTypoProfile>,
     /// 五笔混输拼音回退使用的方案和请求缓冲，逐键刷新时复用。
@@ -200,6 +201,7 @@ impl ImeSession {
             sentence_scorer: Default::default(),
             first_page_rows: FirstPageRows::default(),
             sentence_association: SentenceAssociationOptions::default(),
+            english_mixed_candidates: false,
             rescoring_context: String::new(),
             typo_profile: PersonalTypoProfile::shared(&paths.user(assets::USER_JOURNAL)),
             mixed_pinyin_scheme: QuanpinScheme::new(),
@@ -224,6 +226,10 @@ impl ImeSession {
     /// 粤拼候选的输出转换（例如繁转简）；`None` 照词库原样输出。只影响之后的查询。
     pub fn set_cantonese_output_conversion(&mut self, conversion: Option<TextConversion>) {
         self.registry.set_cantonese_output_conversion(conversion);
+    }
+
+    pub fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        self.english_mixed_candidates = enabled;
     }
 
     pub fn candidates(&self) -> &[WordItem] {
@@ -1234,6 +1240,7 @@ impl ImeSession {
             self.autocorrect_types & autocorrect_type::NEIGHBOR != 0;
         request.fuzzy_pinyin = self.fuzzy;
         request.sentence_association = self.sentence_association.clone();
+        request.english_mixed_candidates = self.english_mixed_candidates;
         request.first_page_rows = self.first_page_rows;
         request
             .rescoring_context

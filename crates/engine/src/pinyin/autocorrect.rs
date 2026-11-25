@@ -596,6 +596,32 @@ impl Search {
     }
 }
 
+/// 当前缀到 `length - 1` 已有完整音节或同权换位切分（如 `niuz`、`hauz`）时，末尾两字母让给「纠错头 + 简拼尾」；前缀无法这样成读时（如 `meiyouwenit`），放行末尾两字母纠错。
+fn prefers_trailing_jianpin_split(search: &Search, length: usize) -> bool {
+    if length < 2 {
+        return false;
+    }
+    let head_end = length - 1;
+    let Some(min_parent_edges) = search.best[length - 2]
+        .iter()
+        .map(|hyp| hyp.edge_count)
+        .min()
+    else {
+        return false;
+    };
+    search.best[head_end].iter().any(|hyp| {
+        if hyp.edge_count == 0 {
+            return true;
+        }
+        if !hyp.corrected || hyp.edge_count > min_parent_edges + 1 {
+            return false;
+        }
+        let prev_pos = head_end - hyp.raw_length;
+        let prev_weight = search.best[prev_pos][hyp.prev_index].weight;
+        hyp.weight - prev_weight <= TRANSPOSITION_WEIGHT
+    })
+}
+
 /// The k best cuts that contain at least one and at most three corrections, sorted by (edges, weight, arrival) and deduplicated by syllable sequence (QU:683-848). Empty for `k == 0`, no types, empty input, more than 64 letters, or any `'`.
 pub fn autocorrect_cut_kbest(
     pinyin: &str,
@@ -637,8 +663,12 @@ pub fn autocorrect_cut_kbest(
                 search.extend(length, start, raw_length, syllable, false, 0);
                 continue;
             }
-            // 两字母错键落在输入末尾时，第二个字母若能开始音节（`hauz` 的 `uz`），它更像下一个音节的简拼开头，交给「纠错头 + 简拼尾」去读（hua'z），不读成 ha'zu。
-            if raw_length == 2 && start + 2 == length && is_prefix_piece(&piece[1..]) {
+            // 两字母错键落在输入末尾时，若前缀已能拼出合法头或换位头（`hauz` 的 `hau` -> `hua`），优先交给「纠错头 + 简拼尾」（`hua'z`）；若前缀无此读法（`meiyouwenit`），保留末尾换位纠错（`mei'you'wen'ti`）。
+            if raw_length == 2
+                && start + 2 == length
+                && is_prefix_piece(&piece[1..])
+                && prefers_trailing_jianpin_split(&search, length)
+            {
                 continue;
             }
             let Some(targets) = index.get(piece) else {
@@ -763,7 +793,11 @@ pub fn autocorrect_cut_kbest_with_touch(
                 search.extend(length, start, raw_length, syllable, false, 0);
                 continue;
             }
-            if raw_length == 2 && start + 2 == length && is_prefix_piece(&piece[1..]) {
+            if raw_length == 2
+                && start + 2 == length
+                && is_prefix_piece(&piece[1..])
+                && prefers_trailing_jianpin_split(&search, length)
+            {
                 continue;
             }
             if let Some(targets) = index.get(piece) {

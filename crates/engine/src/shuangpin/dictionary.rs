@@ -19,6 +19,7 @@ use super::utils::{convert_seg_shuangpin_to_seg_complete_pinyin, pinyin_segmenta
 use super::ShuangpinProfile;
 use crate::assets;
 use crate::cache::FifoCache;
+use crate::dictionary::english::EnglishDictionary;
 use crate::dictionary::pinyin::PinyinDatabase;
 use crate::dictionary::DictRow;
 use crate::helpcode::{
@@ -109,6 +110,8 @@ pub struct ShuangpinDictionary {
     collocation_db: Option<Arc<crate::lattice::octagram::GramDb>>,
     sentence_alternatives: bool,
     sentence_association: SentenceAssociationOptions,
+    english_mixed_candidates: bool,
+    english_dictionary: Option<EnglishDictionary>,
     fuzzy_pinyin: FuzzyPinyinOptions,
     rescoring_context: String,
     /// `generate` answers per key (`_cached_buffer`).
@@ -180,6 +183,8 @@ impl ShuangpinDictionary {
             collocation_db: None,
             sentence_alternatives: false,
             sentence_association: SentenceAssociationOptions::default(),
+            english_mixed_candidates: false,
+            english_dictionary: None,
             fuzzy_pinyin: FuzzyPinyinOptions::default(),
             rescoring_context: String::new(),
             rows_cache: FifoCache::new(CACHE_CAPACITY),
@@ -498,6 +503,9 @@ impl ShuangpinDictionary {
         append_prefix_rows(&mut candidates, prefix_rows);
 
         self.merge_sentences(&mut candidates, &segments, segmentation, pure, rows_key);
+        if !pure.contains('\'') && rows_key == pure {
+            self.inject_mixed_english(pure, &mut candidates);
+        }
 
         let key = key.take().unwrap_or_else(|| series_key.to_owned());
         self.series_cache.insert(key.clone(), candidates.clone());
@@ -1056,6 +1064,40 @@ impl ShuangpinDictionary {
         }
         self.sentence_alternatives = enabled;
         self.series_cache.clear();
+    }
+
+    pub fn set_english_mixed_candidates(&mut self, enabled: bool) {
+        if self.english_mixed_candidates == enabled {
+            return;
+        }
+        self.english_mixed_candidates = enabled;
+        self.series_cache.clear();
+        self.single_helpcode_cache.clear();
+        self.reversed_single_helpcode_cache.clear();
+        self.double_helpcode_cache.clear();
+    }
+
+    pub(super) fn inject_mixed_english(&mut self, raw: &str, candidates: &mut Vec<WordItem>) {
+        if !self.english_mixed_candidates || !self.sentence_association.word_lattice {
+            return;
+        }
+        let paths = &self.paths;
+        let english_dict = self.english_dictionary.get_or_insert_with(|| {
+            EnglishDictionary::open(
+                &paths.dictionary(assets::ENGLISH_DICTIONARY),
+                Some(&paths.resource(assets::TRANSLATIONS)),
+                Some(&paths.user(assets::LEARNED_GLOSSES)),
+            )
+        });
+        let options = self.sentence_tables.options(self.sentence_alternatives);
+        let mixed = crate::lattice::mixed_english::decode_mixed_english_shuangpin(
+            raw,
+            self.profile,
+            &self.database,
+            Some(english_dict),
+            &options,
+        );
+        crate::lattice::mixed_english::merge_mixed_english_candidates(candidates, mixed);
     }
 
     /// Loads the keyboard sentence model from the resource bundle when its switch is on; a model that fails to load contributes no rows. The desktop model is not the engine's: only the runtime's settled reranker runs it. A change resets the caches (neural-association.patch:3080-3095).
