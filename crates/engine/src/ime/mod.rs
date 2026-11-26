@@ -126,6 +126,8 @@ pub struct ImeSession {
     key_geometry: Option<Arc<KeyGeometry>>,
     /// 按触点计价的参数，随每个请求带给双拼引擎。
     touch_tuning: TouchTuning,
+    #[cfg(test)]
+    decode_count: usize,
 }
 
 /// 日文混输对当前组字的判断：整段按罗马字转换出的最佳日文，以及决定要不要给、放在哪里的信号。
@@ -220,9 +222,16 @@ impl ImeSession {
             mixed_japanese_request: QueryRequest::default(),
             key_geometry: None,
             touch_tuning: TouchTuning::default(),
+            #[cfg(test)]
+            decode_count: 0,
         };
         session.bind_wubi_scheme();
         Ok(session)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode_count(&self) -> usize {
+        self.decode_count
     }
 
     pub(crate) fn handle_quanpin_letter_deferred(&mut self, letter: u8) -> bool {
@@ -1138,6 +1147,10 @@ impl ImeSession {
             self.state.candidates.clear();
             self.state.wubi_codes.clear();
             return;
+        }
+        #[cfg(test)]
+        {
+            self.decode_count += 1;
         }
 
         // The Zhuyin list is the editor's own: its rows exist only while the user has it open.

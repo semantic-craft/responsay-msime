@@ -15969,6 +15969,246 @@ fn quanpin_spatial_touch_rescues_border_slips_and_false_redirects_without_clean_
     }
 }
 
+#[test]
+fn burst_tail_key_decodes_once_and_matches_non_deferred_output() {
+    let fixture = Fixture::new(
+        "CREATE TABLE tbl_1_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_j VALUES('jin','j','今',80000);
+         CREATE TABLE tbl_1_t(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_t VALUES('tian','t','天',90000);
+         CREATE TABLE tbl_1_x(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_x VALUES('xia','x','下',70000);
+         CREATE TABLE tbl_1_w(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_1_w VALUES('wu','w','午',60000),('w','w','网',10000);
+         CREATE TABLE tbl_2_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_j VALUES('jin''tian','jt','今天',500000);
+         CREATE TABLE tbl_2_x(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_x VALUES('xia''wu','xw','下午',450000);
+         CREATE TABLE tbl_4_j(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_4_j VALUES('jin''tian''xia''wu','jtxw','今天下午',950000);",
+    );
+
+    let mut keys = [[0.0f32; 4]; 26];
+    for (letters, left, y) in [
+        ("qwertyuiop", 5.0, 7.0),
+        ("asdfghjkl", 10.0, 21.0),
+        ("zxcvbnm", 20.0, 35.0),
+    ] {
+        for (col, byte) in letters.bytes().enumerate() {
+            keys[usize::from(byte - b'a')] = [left + 10.0 * col as f32, y, 10.0, 14.0];
+        }
+    }
+    let geom = Arc::new(crate::touch::KeyGeometry::new(9, &keys, None, &[]).unwrap());
+
+    for use_touch in [false, true] {
+        let make_session = || {
+            let mut options = SessionOptions::new(fixture.paths().clone());
+            options.learning = false;
+            options.personal_context = false;
+            options.autocorrect_types = crate::types::autocorrect_type::TRANSPOSITION
+                | crate::types::autocorrect_type::NEIGHBOR
+                | crate::types::autocorrect_type::MISSING_OR_EXTRA;
+            let mut s = Session::new(options).unwrap();
+            if use_touch {
+                s.set_key_geometry(Some(Arc::clone(&geom)));
+            }
+            s
+        };
+
+        let mut baseline = make_session();
+        let mut burst = make_session();
+        let phrase = b"jintianxiawu";
+        for (idx, &ch) in phrase.iter().enumerate() {
+            if use_touch {
+                let rect = keys[usize::from(ch - b'a')];
+                baseline.set_key_touch(geom.touch(ch, rect[0], rect[1]));
+                burst.set_key_touch(geom.touch(ch, rect[0], rect[1]));
+            }
+            assert!(baseline.character_with_defer(ch, false, false).handled);
+            assert!(burst.character_with_defer(ch, false, idx < 11).handled);
+            if idx < 11 {
+                assert!(burst.has_deferred_candidates());
+                assert_eq!(burst.input.engine.decode_count(), 0);
+            }
+        }
+
+        assert!(!burst.has_deferred_candidates());
+        assert_eq!(baseline.input.engine.decode_count(), 12);
+        assert_eq!(
+            burst.input.engine.decode_count(),
+            1,
+            "11 deferred keys + 1 non-deferred tail key must run candidate decode exactly once"
+        );
+        assert_eq!(
+            burst.display_snapshot().preedit,
+            baseline.display_snapshot().preedit
+        );
+        assert_eq!(
+            burst.display_snapshot().editing_text,
+            baseline.display_snapshot().editing_text
+        );
+        assert_eq!(
+            burst.display_snapshot().candidates,
+            baseline.display_snapshot().candidates
+        );
+
+        let base_commit = baseline.command(Command::CommitCandidate);
+        let burst_commit = burst.command(Command::CommitCandidate);
+        assert_eq!(burst_commit.commit.as_deref(), Some("今天下午"));
+        assert_eq!(burst_commit.commit, base_commit.commit);
+        assert_eq!(
+            burst.last_committed_pinyin_spans(),
+            baseline.last_committed_pinyin_spans()
+        );
+    }
+
+    let mut url_session = {
+        let mut options = SessionOptions::new(fixture.paths().clone());
+        options.learning = false;
+        options.personal_context = false;
+        Session::new(options).unwrap()
+    };
+    for _ in 0..3 {
+        assert!(url_session.character_with_defer(b'w', false, true).handled);
+    }
+    assert!(url_session.has_deferred_candidates());
+    assert!(url_session.character_with_defer(b'.', false, false).handled);
+    assert!(!url_session.has_deferred_candidates());
+    assert_eq!(
+        url_session.display_snapshot().local_mode,
+        LocalInputMode::Url
+    );
+    assert_eq!(url_session.display_snapshot().editing_text, "www.");
+}
+
+#[test]
+fn read_only_overlay_filters_manual_rows_enforces_caps_and_skips_journal_when_json_fresh() {
+    use crate::dictionary::overlay::{
+        UserOverlayData, MAX_OVERLAY_ENTRIES, MAX_OVERLAY_JSON_BYTES, OVERLAY_SNAPSHOT_FILENAME,
+    };
+
+    let huge_json = format!(
+        r#"{{"version":1,"revision":"big","entries":[{{"dictionary":"quick","key":"k","value":"{}","operation":"upsert","weight":1}}]}}"#,
+        "a".repeat(MAX_OVERLAY_JSON_BYTES)
+    );
+    assert!(UserOverlayData::from_json(&huge_json).is_err());
+
+    let many_entries: String = (0..=MAX_OVERLAY_ENTRIES)
+        .map(|i| {
+            format!(
+                r#"{{"dictionary":"quick","key":"k{i}","value":"v","operation":"upsert","weight":1}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let too_many_json = format!(r#"{{"version":1,"revision":"many","entries":[{many_entries}]}}"#);
+    assert!(UserOverlayData::from_json(&too_many_json).is_err());
+
+    let temp = tempfile::tempdir().unwrap();
+    let resources_dir = temp.path().join("bundle");
+    let ime_dir = temp.path().join("IME");
+    let user_dir = ime_dir.join("user");
+    let cache_dir = ime_dir.join("cache");
+    std::fs::create_dir_all(&resources_dir).unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let pinyin_db = resources_dir.join(assets::MAIN_DICTIONARY);
+    let conn = Connection::open(&pinyin_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tbl_2_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);
+         INSERT INTO tbl_2_c VALUES('ce''shi','cs','测试',5000),('ce''shi','cs','侧室',4000);",
+    )
+    .unwrap();
+    drop(conn);
+    let english_db = resources_dir.join(assets::ENGLISH_DICTIONARY);
+    let econn = Connection::open(&english_db).unwrap();
+    econn
+        .execute_batch(
+            "CREATE TABLE english_words(word TEXT,display TEXT,weight INTEGER);
+         INSERT INTO english_words VALUES('alpha','Alpha',100);",
+        )
+        .unwrap();
+    drop(econn);
+
+    let journal_path = user_dir.join(assets::USER_JOURNAL);
+    let jconn = Connection::open(&journal_path).unwrap();
+    jconn
+        .execute_batch(
+            "CREATE TABLE user_dictionary_operations(
+                dictionary TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                weight INTEGER NOT NULL DEFAULT 0,
+                display TEXT NOT NULL DEFAULT '',
+                user_inserted INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO user_dictionary_operations VALUES('pinyin','ce''shi','手动词','upsert',90000,'',1,1);
+             INSERT INTO user_dictionary_operations VALUES('pinyin','ce''shi','自学习词','upsert',999999,'',0,2);
+             INSERT INTO user_dictionary_operations VALUES('pinyin','ce''shi','侧室','delete',0,'',1,3);",
+        )
+        .unwrap();
+    drop(jconn);
+
+    let paths = RuntimePaths {
+        resources: resources_dir.clone(),
+        user_data: user_dir.clone(),
+        cache: cache_dir.clone(),
+        dictionaries: resources_dir.clone(),
+    };
+    let make_ro_session = || {
+        let mut opts = SessionOptions::new(paths.clone());
+        opts.learning = false;
+        opts.personal_context = false;
+        opts.learn_english_on_enter = false;
+        Session::new(opts).unwrap()
+    };
+
+    let mut journal_session = make_ro_session();
+    type_text(&mut journal_session, "ceshi");
+    assert_eq!(
+        words(&journal_session).first().map(String::as_str),
+        Some("手动词")
+    );
+    assert!(!words(&journal_session).iter().any(|w| w == "自学习词"));
+    assert!(!words(&journal_session).iter().any(|w| w == "侧室"));
+
+    std::fs::write(&journal_path, b"corrupt-sqlite-bytes-must-not-be-opened").unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+    let overlay_json_path = ime_dir.join(OVERLAY_SNAPSHOT_FILENAME);
+    std::fs::write(
+        &overlay_json_path,
+        r#"{"version":1,"revision":"json-1","entries":[
+            {"dictionary":"pinyin","key":"ce'shi","value":"快照置顶词","operation":"upsert","weight":120000,"display":""},
+            {"dictionary":"pinyin","key":"ce'shi","value":"测试","operation":"delete","weight":0,"display":""}
+        ]}"#,
+    )
+    .unwrap();
+
+    let mut json_session = make_ro_session();
+    type_text(&mut json_session, "ceshi");
+    assert_eq!(
+        words(&json_session).first().map(String::as_str),
+        Some("快照置顶词")
+    );
+    assert!(!words(&json_session).iter().any(|w| w == "测试"));
+
+    std::thread::sleep(Duration::from_millis(15));
+    std::fs::write(
+        &overlay_json_path,
+        r#"{"version":1,"revision":"json-empty","entries":[]}"#,
+    )
+    .unwrap();
+    let mut empty_json_session = make_ro_session();
+    type_text(&mut empty_json_session, "ceshi");
+    assert_eq!(
+        words(&empty_json_session).first().map(String::as_str),
+        Some("测试")
+    );
+}
+
 mod caret_suffix;
 mod grid_exact;
 mod grid_helpcode;

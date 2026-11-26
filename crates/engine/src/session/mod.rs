@@ -92,9 +92,8 @@ impl Session {
             !options.learning && options.paths.dictionaries == options.paths.resources;
         let overlay = SharedUserOverlay::default();
         if read_only_dictionaries {
-            if let Some(data) = UserOverlayData::load_one_shot_journal(
-                &options.paths.user(crate::assets::USER_JOURNAL),
-            ) {
+            if let Some(data) = UserOverlayData::load_initial_for_user_dir(&options.paths.user_data)
+            {
                 overlay.replace(data);
             }
         }
@@ -247,12 +246,28 @@ impl Session {
         self.input.clock = clock;
     }
 
+    fn can_defer_quanpin_character(&self, value: u8, shift_only: bool) -> bool {
+        let grid_digit = match self.key_grid {
+            Some(KeyGrid::NineKey) => (b'2'..=b'9').contains(&value),
+            Some(grid @ KeyGrid::NineKeyShuangpin(_)) => {
+                !self.input.dedicated_english && grid.is_code(value)
+            }
+            _ => false,
+        };
+        !grid_digit
+            && !self.nine_key.active()
+            && !self.requires_candidate_selection()
+            && self.input.can_defer_quanpin_letter(value, shift_only)
+    }
+
     /// One ASCII character; `shift_only` is a bare Shift+letter (local mode entry). 全拼下九键开启且没有别的组字时，数字 2-9 交给九宫格会话；九键双拼交的是方案用到的数字（可以有 1 和 0）；注音九键的数字由注音编辑器自己处理。待用的触点（[`Self::set_key_touch`]）只交给 26 键组字，九宫格的数字用不到它，一律在这一键后作废。
     pub fn character(&mut self, value: u8, shift_only: bool) -> KeyResult {
-        self.flush_deferred_candidates();
+        let touch = self.input.pending_touch.take();
+        if self.candidates_dirty && self.can_defer_quanpin_character(value, shift_only) {
+            self.candidates_dirty = false;
+        }
         self.candidates_may_change();
         self.prediction.clear();
-        let touch = self.input.pending_touch.take();
         if let Some(result) = self.input.edit_pending_glide(value) {
             return result;
         }
@@ -298,18 +313,7 @@ impl Session {
         if !defer_candidates {
             return self.character(value, shift_only);
         }
-        let grid_digit = match self.key_grid {
-            Some(KeyGrid::NineKey) => (b'2'..=b'9').contains(&value),
-            Some(grid @ KeyGrid::NineKeyShuangpin(_)) => {
-                !self.input.dedicated_english && grid.is_code(value)
-            }
-            _ => false,
-        };
-        if !grid_digit
-            && !self.nine_key.active()
-            && !self.requires_candidate_selection()
-            && self.input.can_defer_quanpin_letter(value, shift_only)
-        {
+        if self.can_defer_quanpin_character(value, shift_only) {
             self.revision = self.revision.wrapping_add(1);
             self.input.committed_spans.clear();
             self.prediction.clear();

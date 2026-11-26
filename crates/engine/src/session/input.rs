@@ -1911,6 +1911,7 @@ impl InputSession {
             && self.scheme() == SchemeType::Quanpin
             && self.local_mode == LocalInputMode::None
             && !self.dedicated_english
+            && !self.glide_selection_pending
             && self.conversion.is_none()
             && self.helpcode_entry.is_none()
             && !self.takes_literal_symbol(value)

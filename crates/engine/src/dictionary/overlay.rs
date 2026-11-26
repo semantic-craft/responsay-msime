@@ -1,11 +1,13 @@
 //! In-memory user dictionary overlay (`pinyin`, `quick`, `english`) for read-only lexicon sessions.
 
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
@@ -15,9 +17,51 @@ use super::DictRow;
 use crate::error::{EngineError, Result};
 use crate::format::quanpin_table;
 
+pub const MAX_OVERLAY_JSON_BYTES: usize = 524_288;
+pub const MAX_OVERLAY_ENTRIES: usize = 8_192;
+pub const OVERLAY_SNAPSHOT_FILENAME: &str = "typing-user-overlay.json";
 const MAX_OVERLAY_KEY_BYTES: usize = 512;
 const MAX_OVERLAY_VALUE_BYTES: usize = 4 * 1024;
 const MAX_OVERLAY_DISPLAY_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OverlayPair(pub String, pub String);
+
+pub trait OverlayPairLookup {
+    fn as_pair(&self) -> (&str, &str);
+}
+
+impl OverlayPairLookup for OverlayPair {
+    fn as_pair(&self) -> (&str, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl OverlayPairLookup for (&str, &str) {
+    fn as_pair(&self) -> (&str, &str) {
+        *self
+    }
+}
+
+impl PartialEq for dyn OverlayPairLookup + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_pair() == other.as_pair()
+    }
+}
+
+impl Eq for dyn OverlayPairLookup + '_ {}
+
+impl std::hash::Hash for dyn OverlayPairLookup + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_pair().hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn OverlayPairLookup + 'a> for OverlayPair {
+    fn borrow(&self) -> &(dyn OverlayPairLookup + 'a) {
+        self
+    }
+}
 
 fn default_overlay_weight() -> i64 {
     INSERTED_WEIGHT
@@ -55,7 +99,7 @@ pub struct PinyinOverlayRow {
 #[derive(Debug, Clone, Default)]
 pub struct PinyinTableOverlay {
     pub upserts: Vec<PinyinOverlayRow>,
-    pub deleted: HashSet<(String, String)>,
+    pub deleted: HashSet<OverlayPair>,
 }
 
 impl PinyinTableOverlay {
@@ -64,7 +108,10 @@ impl PinyinTableOverlay {
     }
 
     pub fn is_deleted(&self, key: &str, value: &str) -> bool {
-        !self.deleted.is_empty() && self.deleted.iter().any(|(dk, dv)| dk == key && dv == value)
+        !self.deleted.is_empty()
+            && self
+                .deleted
+                .contains(&(key, value) as &dyn OverlayPairLookup)
     }
 
     pub fn find_upsert_weight(&self, key: &str, value: &str) -> Option<i64> {
@@ -80,7 +127,7 @@ impl PinyinTableOverlay {
 
     fn apply_upsert(&mut self, key: String, jp: String, value: String, weight: i64) {
         self.deleted
-            .retain(|(dk, dv)| !(dk == &key && dv == &value));
+            .remove(&(key.as_str(), value.as_str()) as &dyn OverlayPairLookup);
         if let Some(existing) = self
             .upserts
             .iter_mut()
@@ -101,7 +148,7 @@ impl PinyinTableOverlay {
     fn apply_delete(&mut self, key: String, value: String) {
         self.upserts
             .retain(|row| !(row.key == key && row.value == value));
-        self.deleted.insert((key, value));
+        self.deleted.insert(OverlayPair(key, value));
     }
 
     fn finalize(&mut self) {
@@ -112,7 +159,7 @@ impl PinyinTableOverlay {
 #[derive(Debug, Clone, Default)]
 pub struct QuickOverlay {
     pub upserts: Vec<DictRow>,
-    pub deleted: HashSet<(String, String)>,
+    pub deleted: HashSet<OverlayPair>,
 }
 
 impl QuickOverlay {
@@ -121,7 +168,10 @@ impl QuickOverlay {
     }
 
     pub fn is_deleted(&self, key: &str, value: &str) -> bool {
-        !self.deleted.is_empty() && self.deleted.iter().any(|(dk, dv)| dk == key && dv == value)
+        !self.deleted.is_empty()
+            && self
+                .deleted
+                .contains(&(key, value) as &dyn OverlayPairLookup)
     }
 
     pub fn has_upsert(&self, key: &str, value: &str) -> bool {
@@ -132,7 +182,7 @@ impl QuickOverlay {
 
     fn apply_upsert(&mut self, key: String, value: String, weight: i64) {
         self.deleted
-            .retain(|(dk, dv)| !(dk == &key && dv == &value));
+            .remove(&(key.as_str(), value.as_str()) as &dyn OverlayPairLookup);
         if let Some(existing) = self
             .upserts
             .iter_mut()
@@ -147,7 +197,7 @@ impl QuickOverlay {
     fn apply_delete(&mut self, key: String, value: String) {
         self.upserts
             .retain(|row| !(row.key == key && row.value == value));
-        self.deleted.insert((key, value));
+        self.deleted.insert(OverlayPair(key, value));
     }
 
     fn finalize(&mut self) {
@@ -171,7 +221,7 @@ pub struct EnglishOverlayRow {
 #[derive(Debug, Clone, Default)]
 pub struct EnglishOverlay {
     pub upserts: Vec<EnglishOverlayRow>,
-    pub deleted: HashSet<(String, String)>,
+    pub deleted: HashSet<OverlayPair>,
 }
 
 impl EnglishOverlay {
@@ -183,8 +233,7 @@ impl EnglishOverlay {
         !self.deleted.is_empty()
             && self
                 .deleted
-                .iter()
-                .any(|(dw, dd)| dw == word && dd == display)
+                .contains(&(word, display) as &dyn OverlayPairLookup)
     }
 
     pub fn has_upsert(&self, word: &str, display: &str) -> bool {
@@ -195,7 +244,7 @@ impl EnglishOverlay {
 
     fn apply_upsert(&mut self, word: String, display: String, weight: i64) {
         self.deleted
-            .retain(|(dw, dd)| !(dw == &word && dd == &display));
+            .remove(&(word.as_str(), display.as_str()) as &dyn OverlayPairLookup);
         if let Some(existing) = self
             .upserts
             .iter_mut()
@@ -214,7 +263,7 @@ impl EnglishOverlay {
     fn apply_delete(&mut self, word: String, display: String) {
         self.upserts
             .retain(|row| !(row.word == word && row.display == display));
-        self.deleted.insert((word, display));
+        self.deleted.insert(OverlayPair(word, display));
     }
 
     fn finalize(&mut self) {
@@ -257,12 +306,23 @@ impl UserOverlayData {
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
+        if json.len() > MAX_OVERLAY_JSON_BYTES {
+            return Err(EngineError::invalid(format!(
+                "user overlay json exceeds maximum size ({MAX_OVERLAY_JSON_BYTES} bytes)"
+            )));
+        }
         let wire: UserOverlayWire = serde_json::from_str(json)
             .map_err(|error| EngineError::invalid(format!("invalid user overlay json: {error}")))?;
         if wire.version != 1 {
             return Err(EngineError::invalid(format!(
                 "unsupported user overlay version {}",
                 wire.version
+            )));
+        }
+        if wire.entries.len() > MAX_OVERLAY_ENTRIES {
+            return Err(EngineError::invalid(format!(
+                "user overlay entry count {} exceeds limit ({MAX_OVERLAY_ENTRIES})",
+                wire.entries.len()
             )));
         }
         let mut data = Self {
@@ -331,6 +391,83 @@ impl UserOverlayData {
         Ok(data)
     }
 
+    pub fn load_initial_for_user_dir(user_data: &Path) -> Option<Self> {
+        if user_data.as_os_str().is_empty() {
+            return None;
+        }
+        let journal_path = user_data.join(crate::assets::USER_JOURNAL);
+        let journal_meta = std::fs::symlink_metadata(&journal_path)
+            .ok()
+            .filter(|meta| meta.file_type().is_file());
+        let journal_mtime = journal_meta.as_ref().and_then(|meta| meta.modified().ok());
+
+        let mut candidates = Vec::with_capacity(3);
+        if let Some(parent) = user_data.parent() {
+            candidates.push(parent.join(OVERLAY_SNAPSHOT_FILENAME));
+            if parent.file_name().and_then(|name| name.to_str()) != Some("IME") {
+                candidates.push(parent.join("IME").join(OVERLAY_SNAPSHOT_FILENAME));
+            }
+        }
+        candidates.push(user_data.join(OVERLAY_SNAPSHOT_FILENAME));
+
+        for candidate in candidates {
+            match Self::try_read_fresh_overlay_json(
+                &candidate,
+                journal_meta.is_some(),
+                journal_mtime,
+            ) {
+                Some(Ok(data)) => return (!data.is_empty()).then_some(data),
+                Some(Err(())) => break,
+                None => {}
+            }
+        }
+
+        if journal_meta.is_some() {
+            return Self::load_one_shot_journal(&journal_path);
+        }
+        None
+    }
+
+    fn try_read_fresh_overlay_json(
+        candidate: &Path,
+        journal_exists: bool,
+        journal_mtime: Option<SystemTime>,
+    ) -> Option<std::result::Result<Self, ()>> {
+        let meta = std::fs::symlink_metadata(candidate).ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+        let len = usize::try_from(meta.len()).ok()?;
+        if len == 0 || len > MAX_OVERLAY_JSON_BYTES {
+            return None;
+        }
+        if journal_exists {
+            let (Ok(overlay_mtime), Some(db_mtime)) = (meta.modified(), journal_mtime) else {
+                return Some(Err(()));
+            };
+            if overlay_mtime < db_mtime {
+                return Some(Err(()));
+            }
+        }
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        if msime_path_trust::reject_symlinked_components(candidate).is_err() {
+            return None;
+        }
+        let file = crate::paths::open_file_no_follow(candidate).ok()?;
+        let mut bytes = Vec::with_capacity(len);
+        if file
+            .take((MAX_OVERLAY_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.is_empty()
+            || bytes.len() > MAX_OVERLAY_JSON_BYTES
+        {
+            return None;
+        }
+        let json = std::str::from_utf8(&bytes).ok()?;
+        Self::from_json(json).ok().map(Ok)
+    }
+
     /// Performs a one-shot `SQLITE_OPEN_READ_ONLY` (`busy_timeout = 0`) replay of
     /// `user_dictionary_operations` from `journal_path`, dropping the SQLite connection
     /// immediately before returning so zero descriptors or locks remain open on `msime_user.db`.
@@ -359,7 +496,7 @@ impl UserOverlayData {
             let Ok(mut statement) = connection.prepare(
                 "SELECT dictionary, key, value, operation, weight, display \
                  FROM user_dictionary_operations \
-                 WHERE dictionary IN ('pinyin', 'quick', 'english') \
+                 WHERE dictionary IN ('pinyin', 'quick', 'english') AND user_inserted = 1 \
                  ORDER BY updated_at, rowid",
             ) else {
                 return None;

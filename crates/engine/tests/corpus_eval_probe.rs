@@ -581,12 +581,14 @@ fn read_only_bundle_overlay_json_and_one_shot_journal_zero_fds() {
                 operation TEXT NOT NULL,
                 weight INTEGER NOT NULL DEFAULT 0,
                 display TEXT NOT NULL DEFAULT '',
+                user_inserted INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT 0
              );
-             INSERT INTO user_dictionary_operations VALUES ('pinyin', 'ce''shi', '策士', 'upsert', 99000, '', 1);
-             INSERT INTO user_dictionary_operations VALUES ('pinyin', 'ce''shi', '侧室', 'delete', 0, '', 2);
-             INSERT INTO user_dictionary_operations VALUES ('english', 'responsay', 'responsay', 'upsert', 5000000, 'ResponSayPro', 3);
-             INSERT INTO user_dictionary_operations VALUES ('english', 'obsolete', 'obsolete', 'delete', 0, 'obsolete', 4);",
+             INSERT INTO user_dictionary_operations VALUES ('pinyin', 'ce''shi', '策士', 'upsert', 99000, '', 1, 1);
+             INSERT INTO user_dictionary_operations VALUES ('pinyin', 'ce''shi', '自动学词勿载', 'upsert', 999999, '', 0, 2);
+             INSERT INTO user_dictionary_operations VALUES ('pinyin', 'ce''shi', '侧室', 'delete', 0, '', 1, 3);
+             INSERT INTO user_dictionary_operations VALUES ('english', 'responsay', 'responsay', 'upsert', 5000000, 'ResponSayPro', 1, 4);
+             INSERT INTO user_dictionary_operations VALUES ('english', 'obsolete', 'obsolete', 'delete', 0, 'obsolete', 1, 5);",
         )
         .unwrap();
     }
@@ -611,6 +613,7 @@ fn read_only_bundle_overlay_json_and_one_shot_journal_zero_fds() {
         .map(|c| c.word.to_string())
         .collect();
     assert_eq!(words.first().map(String::as_str), Some("策士"));
+    assert!(!words.iter().any(|w| w == "自动学词勿载"));
     assert!(!words.iter().any(|w| w == "侧室"));
 
     #[cfg(unix)]
