@@ -6,6 +6,7 @@ use crate::assets;
 use crate::dictionary::english::{
     takes_priority_slot, takes_priority_slot_or_own, EnglishDictionary,
 };
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::lattice::offensive::is_offensive_english;
 use crate::local::chaizi::query_chaizi;
 use crate::local::command::{
@@ -18,10 +19,11 @@ use crate::local::emoji::{
     MIXED_FETCH_LIMIT, MIXED_RESULT_LIMIT, MODE_RESULT_LIMIT,
 };
 use crate::local::expression::query_expression;
-use crate::local::jianpin::{query_jianpin, result_limit};
+use crate::local::jianpin::{query_jianpin_with_overlay, result_limit};
 use crate::local::mention::{mention_annotation, query_mentions, usable_mentions};
 use crate::local::quick_phrase::{
-    merge_quick_phrases, query_exact_quick_phrases, query_quick_phrases, usable_quick_phrase_table,
+    merge_quick_phrases, query_exact_quick_phrases_with_overlay, query_quick_phrases_with_overlay,
+    usable_quick_phrase_table, RESULT_LIMIT as QUICK_PHRASE_RESULT_LIMIT,
 };
 use crate::local::symbol_candidates::{query_mixed_symbols, SymbolRow, MIXED_SYMBOL_LIMIT};
 use crate::local::unicode::query_unicode;
@@ -77,10 +79,22 @@ pub struct CandidateQueries {
     mention_places: bool,
     /// 宿主开着繁体输出：拆字行按转换后的字形去重。
     chaizi_traditional_output: bool,
+    read_only: bool,
+    overlay: SharedUserOverlay,
 }
 
 impl CandidateQueries {
+    #[cfg(test)]
     pub fn new(paths: &RuntimePaths, profile: &'static ShuangpinProfile) -> Self {
+        Self::new_with_options(paths, profile, false, SharedUserOverlay::default())
+    }
+
+    pub fn new_with_options(
+        paths: &RuntimePaths,
+        profile: &'static ShuangpinProfile,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         Self {
             paths: paths.clone(),
             profile,
@@ -92,6 +106,14 @@ impl CandidateQueries {
             mentions: Vec::new(),
             mention_places: false,
             chaizi_traditional_output: false,
+            read_only,
+            overlay,
+        }
+    }
+
+    pub fn clear_english_cache(&self) {
+        if let Some(english) = &self.english {
+            english.clear_cache();
         }
     }
 
@@ -215,10 +237,11 @@ impl CandidateQueries {
         if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_lowercase()) {
             return;
         }
-        let merged = query_exact_quick_phrases(
+        let merged = query_exact_quick_phrases_with_overlay(
             code,
             &self.paths.dictionary(assets::MAIN_DICTIONARY),
             &self.quick_phrase_table,
+            &self.overlay,
         );
         let phrases: Vec<WordItem> = merged
             .candidates
@@ -349,11 +372,13 @@ impl CandidateQueries {
     /// The English dictionary, opened on first use from the generation copy with the resource translations sidecar and the learned-gloss store (candidate_queries.cpp:197-207). The store is a user file because the generation copy is replaced on every new generation and would lose what is written into it; it is `translation-glosses.db` rather than the contract's `gloss_cache.db` because that is the file the host writes and users have (data-formats.md §1.4, §11).
     pub fn english_dictionary(&mut self) -> &EnglishDictionary {
         let paths = &self.paths;
+        let overlay = &self.overlay;
         self.english.get_or_insert_with(|| {
-            EnglishDictionary::open(
+            EnglishDictionary::open_with_overlay(
                 &paths.dictionary(assets::ENGLISH_DICTIONARY),
                 Some(&paths.resource(assets::TRANSLATIONS)),
                 Some(&paths.user(assets::LEARNED_GLOSSES)),
+                overlay.clone(),
             )
         })
     }
@@ -380,7 +405,12 @@ impl CandidateQueries {
             LocalInputMode::DateTime => rows(query_date_time(code, now)),
             LocalInputMode::QuickPhrase => merge_quick_phrases(
                 code,
-                query_quick_phrases(code, &self.paths.dictionary(assets::MAIN_DICTIONARY)),
+                query_quick_phrases_with_overlay(
+                    code,
+                    &self.paths.dictionary(assets::MAIN_DICTIONARY),
+                    QUICK_PHRASE_RESULT_LIMIT,
+                    &self.overlay,
+                ),
                 &self.quick_phrase_table,
             ),
             LocalInputMode::Emoji => query_emoji(
@@ -397,12 +427,13 @@ impl CandidateQueries {
                 MODE_RESULT_LIMIT,
                 shuangpin,
             ),
-            LocalInputMode::SuperJianpin => query_jianpin(
+            LocalInputMode::SuperJianpin => query_jianpin_with_overlay(
                 code,
                 scheme,
                 &self.paths.dictionary(assets::MAIN_DICTIONARY),
                 result_limit(code),
                 shuangpin,
+                &self.overlay,
             ),
             LocalInputMode::TemporaryEnglish => rows(self.temporary_english(code)),
             LocalInputMode::TemporaryJapanese => rows(engine_candidates.to_vec()),
@@ -520,7 +551,10 @@ impl CandidateQueries {
                     seats_without_journal(row)
                         || (short_pinyin
                             && takes_priority_slot_or_own(row, |row| {
-                                row.pinyin == prefix && has_english_upsert(&journal, &row.pinyin)
+                                row.pinyin == prefix
+                                    && (self.overlay.has_english_word(&row.pinyin)
+                                        || (!self.read_only
+                                            && has_english_upsert(&journal, &row.pinyin)))
                             }))
                 });
             english_rows = seated;

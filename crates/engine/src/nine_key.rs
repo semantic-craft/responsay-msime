@@ -24,6 +24,7 @@ use crate::diagnostics;
 use crate::dictionary::english::{
     append_keypad_ranked, seat_nine_key_english, EnglishDictionary, KeypadRow,
 };
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::error::EngineError;
 use crate::ime::queries::{
     insert_expressive_rows, keep_expressive_rows_off_the_lead, MIXED_EXPRESSIVE_MINIMUM_INPUT,
@@ -471,6 +472,8 @@ pub struct NineKeySession {
     grid: KeyGrid,
     /// 全拼九键的可选精确拼写模式。
     precise_nine_key: bool,
+    read_only_dictionaries: bool,
+    overlay: SharedUserOverlay,
 }
 
 /// 一次锁定之前的样子。
@@ -511,6 +514,7 @@ fn choice_kind(choice: &str) -> Choice {
 
 impl NineKeySession {
     /// English options are fixed here; the reference never updated them afterwards. `pinyin` 是会话的 `enabled_schemes` 是否含全拼：九宫格拼的是全拼音节，不含全拼时只给英文行，也不打开拼音词库。
+    #[cfg(test)]
     pub fn new(
         paths: &RuntimePaths,
         learning: bool,
@@ -519,6 +523,31 @@ impl NineKeySession {
         english: EnglishInputOptions,
         pinyin: bool,
         single_character_only: bool,
+    ) -> Self {
+        Self::new_with_options(
+            paths,
+            learning,
+            frequency,
+            fuzzy,
+            english,
+            pinyin,
+            single_character_only,
+            false,
+            SharedUserOverlay::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        paths: &RuntimePaths,
+        learning: bool,
+        frequency: FrequencyAdjustmentOptions,
+        fuzzy: FuzzyPinyinOptions,
+        english: EnglishInputOptions,
+        pinyin: bool,
+        single_character_only: bool,
+        read_only_dictionaries: bool,
+        overlay: SharedUserOverlay,
     ) -> Self {
         Self {
             paths: paths.clone(),
@@ -574,6 +603,22 @@ impl NineKeySession {
             stroke_texts: HashSet::new(),
             grid: KeyGrid::NineKey,
             precise_nine_key: false,
+            read_only_dictionaries,
+            overlay,
+        }
+    }
+
+    pub(crate) fn on_user_overlay_changed(&mut self) {
+        self.english_rows = None;
+        self.rerank_cache.clear();
+        if let Some(dictionary) = self.dictionary.as_mut() {
+            dictionary.reset_cache();
+        }
+        if let Some(english) = self.english.as_ref() {
+            english.clear_cache();
+        }
+        if self.active() {
+            self.refresh();
         }
     }
 
@@ -711,6 +756,8 @@ impl NineKeySession {
             association: self.dictionary_association(),
             alternatives: self.sentence_alternatives,
             first_page_rows: self.first_page_rows,
+            read_only: self.read_only_dictionaries,
+            overlay: self.overlay.clone(),
         }
     }
 
@@ -1081,8 +1128,7 @@ impl NineKeySession {
                 &pinyin,
                 &word,
                 self.mark_learned_words_user_inserted,
-            )
-        {
+            ) {
             Ok(()) => (None, Some(word)),
             Err(EngineError::InvalidArgument(_)) => (None, None),
             Err(_) if phrase => (Some(diagnostics::PHRASE_NOT_PERSISTED.to_string()), None),
@@ -1929,12 +1975,17 @@ impl NineKeySession {
             self.english_candidates(unanswered)
         };
         if !english.is_empty() {
-            let journal = self.paths.user(assets::USER_JOURNAL);
+            let journal = if self.read_only_dictionaries && !self.learning {
+                PathBuf::new()
+            } else {
+                self.paths.user(assets::USER_JOURNAL)
+            };
             seat_nine_key_english(
                 &mut candidates,
                 english,
                 self.digits.len(),
                 &journal,
+                &self.overlay,
                 self.english_options.first_page_count,
                 self.first_page_rows.get(),
             );
@@ -1954,16 +2005,23 @@ impl NineKeySession {
                 insert_inline_date_time(&mut candidates, anchor, kind, digits, || clock(), None);
             }
         }
-        let journal = self.paths.user(assets::USER_JOURNAL);
+        let has_journal = !(self.read_only_dictionaries && !self.learning);
+        let journal = if has_journal {
+            self.paths.user(assets::USER_JOURNAL)
+        } else {
+            PathBuf::new()
+        };
         let position_context = format!("nine-key:{}:{locked_key}", self.digits);
-        positions::apply_fixed_positions(
-            &journal,
-            &position_context,
-            &mut candidates,
-            false,
-            None,
-            false,
-        );
+        if has_journal {
+            positions::apply_fixed_positions(
+                &journal,
+                &position_context,
+                &mut candidates,
+                false,
+                None,
+                false,
+            );
+        }
         keep_expressive_rows_off_the_lead(&mut candidates);
         evict_after_positions(&mut candidates, self.first_page_rows.get(), |item| {
             grid_demotion(item, &vulgar)
@@ -2005,7 +2063,14 @@ impl NineKeySession {
                 self.first_page_rows.get(),
                 grid,
                 |word, kind| {
-                    manually_pinned(&journal, &position_context, locked_key.len(), word, kind)
+                    has_journal
+                        && manually_pinned(
+                            &journal,
+                            &position_context,
+                            locked_key.len(),
+                            word,
+                            kind,
+                        )
                 },
                 &mut self.contests,
             );
@@ -2627,10 +2692,15 @@ impl NineKeySession {
     fn open_english(&mut self) -> Option<&EnglishDictionary> {
         if self.english.is_none() {
             let path = self.paths.dictionary(assets::ENGLISH_DICTIONARY);
-            if !path.exists() {
+            if !path.exists() && !self.overlay.has_english() {
                 return None;
             }
-            self.english = Some(EnglishDictionary::open(&path, None, None));
+            self.english = Some(EnglishDictionary::open_with_overlay(
+                &path,
+                None,
+                None,
+                self.overlay.clone(),
+            ));
         }
         self.english.as_ref()
     }
@@ -2782,11 +2852,14 @@ struct DictionaryOptions {
     association: SentenceAssociationOptions,
     alternatives: bool,
     first_page_rows: FirstPageRows,
+    read_only: bool,
+    overlay: SharedUserOverlay,
 }
 
 /// 打开九键用的词库，带上 `NineKeySession::dictionary_association` 给的句子联想设置。
 fn open_dictionary(paths: &RuntimePaths, options: DictionaryOptions) -> QuanpinDictionary {
-    let mut dictionary = QuanpinDictionary::new(paths);
+    let mut dictionary =
+        QuanpinDictionary::new_with_options(paths, options.read_only, options.overlay);
     dictionary.set_sentence_association(options.association);
     dictionary.set_sentence_alternatives(options.alternatives);
     dictionary.set_first_page_rows(options.first_page_rows);

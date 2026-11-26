@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::assets;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::error::Result;
 use crate::helpcode::SharedKeymap;
 use crate::japanese::matrix::BestPath;
@@ -148,7 +149,7 @@ impl ImeSession {
 
     /// ime_session.cpp:42-49. `cantonese_dictionary`, `zhuyin_dictionary` and `stroke_dictionary` are where `msime-cantonese.db`, `msime-zhuyin.db` and `msime-stroke.db` are, each read only when its scheme is activated; starting in Cantonese, Zhuyin or Stroke fails as `switch_scheme` does when its file cannot be opened. `japanese_dictionary` 是 `msime-japanese.dat` 的位置，为空时读资源目录里的那份。`enabled` 是会话允许运行的方案，`scheme` 不在其中时报 `INPUT_SCHEME_NOT_ENABLED`。
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new_with_options(
         scheme: SchemeType,
         enabled: SchemeSet,
         profile: &'static ShuangpinProfile,
@@ -157,8 +158,10 @@ impl ImeSession {
         zhuyin_dictionary: PathBuf,
         stroke_dictionary: PathBuf,
         japanese_dictionary: PathBuf,
+        read_only: bool,
+        overlay: SharedUserOverlay,
     ) -> Result<Self> {
-        let mut registry = ProviderRegistry::new(
+        let mut registry = ProviderRegistry::new_with_options(
             enabled,
             profile,
             paths,
@@ -166,9 +169,16 @@ impl ImeSession {
             zhuyin_dictionary,
             stroke_dictionary,
             japanese_dictionary,
+            read_only,
+            overlay,
         );
         registry.activate(scheme)?;
         let zhuyin = registry.take_dictionary(scheme);
+        let typo_journal = if read_only {
+            PathBuf::new()
+        } else {
+            paths.user(assets::USER_JOURNAL)
+        };
         let mut session = Self {
             scheme: Scheme::new(
                 scheme,
@@ -203,7 +213,7 @@ impl ImeSession {
             sentence_association: SentenceAssociationOptions::default(),
             english_mixed_candidates: false,
             rescoring_context: String::new(),
-            typo_profile: PersonalTypoProfile::shared(&paths.user(assets::USER_JOURNAL)),
+            typo_profile: PersonalTypoProfile::shared(&typo_journal),
             mixed_pinyin_scheme: QuanpinScheme::new(),
             mixed_pinyin_request: QueryRequest::default(),
             mixed_japanese_scheme: JapaneseRomajiScheme::new(),
@@ -213,6 +223,36 @@ impl ImeSession {
         };
         session.bind_wubi_scheme();
         Ok(session)
+    }
+
+    pub(crate) fn handle_quanpin_letter_deferred(&mut self, letter: u8) -> bool {
+        if self.current_scheme_type() != SchemeType::Quanpin || !letter.is_ascii_lowercase() {
+            return false;
+        }
+        if !self.scheme.handle_key(SchemeKey::Letter(letter)) {
+            return false;
+        }
+        let ch = char::from(letter);
+        self.state.request.scheme = SchemeType::Quanpin;
+        self.state.request.valid = true;
+        self.state.request.raw_input.push(ch);
+        self.state.request.raw_input_with_cases.push(ch);
+        self.state.request.normalized_input.push(ch);
+        self.state.request.raw_segmentation.clear();
+        self.state.request.normalized_segmentation.clear();
+        self.state.request.segmentation.clear();
+        self.state.preedit.push(ch);
+        self.state.candidates.clear();
+        self.state.wubi_codes.clear();
+        true
+    }
+
+    pub(crate) fn flush_deferred_candidates(&mut self) {
+        self.refresh_candidates();
+    }
+
+    pub(crate) fn reset_pinyin_caches(&mut self) {
+        self.registry.reset_pinyin_caches();
     }
 
     /// 选中的触屏入口决定粤拼如何解释同形两键码；新建或切回粤拼时沿用。

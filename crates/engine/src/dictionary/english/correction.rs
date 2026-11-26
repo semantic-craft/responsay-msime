@@ -53,6 +53,15 @@ pub(super) struct CorrectionCache {
     hasher: RandomState,
 }
 
+impl CorrectionCache {
+    pub(super) fn clear(&mut self) {
+        self.pages.clear();
+        self.order.clear();
+        self.words.clear();
+        self.misses.clear();
+    }
+}
+
 #[derive(Clone, Default)]
 struct Path {
     text: String,
@@ -263,10 +272,10 @@ impl EnglishDictionary {
     }
 
     fn exact_correction_word(&self, word: &str) -> Option<Lexeme> {
-        if word.len() < 2 {
+        self.sync_overlay_cache();
+        if word.len() < 2 || !self.ready() {
             return None;
         }
-        let connection = self.connection.as_ref()?;
         let hash = {
             let cache = self.correction_cache.borrow();
             if let Some(item) = cache.words.get(word) {
@@ -278,23 +287,33 @@ impl EnglishDictionary {
             }
             hash
         };
-        let found = connection
-            .prepare_cached(
-                "SELECT display,weight FROM english_words WHERE word=?1 ORDER BY weight DESC,display LIMIT 1",
-            )
-            .ok()
-            .and_then(|mut statement| {
-                statement
-                    .query_row([word], |row| {
-                        Ok(Lexeme {
-                            key: word.to_owned(),
-                            display: row.get(0)?,
-                            weight: row.get(1)?,
+        let found = if self.overlay.has_english() {
+            self.best_exact_row_filtered(word, valid_display)
+                .map(|(display, weight)| Lexeme {
+                    key: word.to_owned(),
+                    display,
+                    weight,
+                })
+        } else {
+            self.connection
+                .as_ref()?
+                .prepare_cached(
+                    "SELECT display,weight FROM english_words WHERE word=?1 ORDER BY weight DESC,display LIMIT 1",
+                )
+                .ok()
+                .and_then(|mut statement| {
+                    statement
+                        .query_row([word], |row| {
+                            Ok(Lexeme {
+                                key: word.to_owned(),
+                                display: row.get(0)?,
+                                weight: row.get(1)?,
+                            })
                         })
-                    })
-                    .ok()
-            })
-            .filter(|item| valid_display(&item.display));
+                        .ok()
+                })
+                .filter(|item| valid_display(&item.display))
+        };
         let mut cache = self.correction_cache.borrow_mut();
         if cache.words.len() + cache.misses.len() >= CACHE_WORDS {
             cache.words.clear();

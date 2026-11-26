@@ -1780,8 +1780,7 @@ mod tests {
             o.personal_context = true;
             o.learn_english_on_enter = true;
             o.mark_learned_words_user_inserted = false;
-            o.autocorrect_types =
-                autocorrect_type::TRANSPOSITION | autocorrect_type::NEIGHBOR;
+            o.autocorrect_types = autocorrect_type::TRANSPOSITION | autocorrect_type::NEIGHBOR;
             o.frequency = frequency(FrequencyAdjustmentMode::Pin, 1, 1);
         });
         assert!(session.learning_enabled());
@@ -1815,7 +1814,10 @@ mod tests {
         session.set_dedicated_english(true);
         type_text(&mut session, "RestrictedSecret");
         assert_eq!(
-            session.command(crate::types::Command::CommitRaw).commit.as_deref(),
+            session
+                .command(crate::types::Command::CommitRaw)
+                .commit
+                .as_deref(),
             Some("RestrictedSecret")
         );
         session.set_dedicated_english(false);
@@ -1876,7 +1878,10 @@ mod tests {
         session.set_dedicated_english(true);
         type_text(&mut session, "LearnedPublic");
         assert_eq!(
-            session.command(crate::types::Command::CommitRaw).commit.as_deref(),
+            session
+                .command(crate::types::Command::CommitRaw)
+                .commit
+                .as_deref(),
             Some("LearnedPublic")
         );
         assert_eq!(

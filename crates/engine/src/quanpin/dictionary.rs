@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::assets::{MAIN_DICTIONARY, NEURAL_MODEL_KEYBOARD, USER_JOURNAL};
 use crate::cache::FifoCache;
 use crate::dictionary::english::EnglishDictionary;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::dictionary::pinyin::{PinyinDatabase, INSERTED_WEIGHT};
 use crate::dictionary::DictRow;
 use crate::error::{EngineError, Result};
@@ -68,9 +69,9 @@ use super::series::{
 };
 use super::typo_edges::{
     collect_priced_quanpin_typo_edges, collect_typo_edges, priced_quanpin_variants,
-    quanpin_touch_leads_correction, quanpin_touch_supports_correction, segments_align_with_raw,
-    EditWindowCache, PricedQuanpinTypo, EDIT_WINDOW_CACHE_CAPACITY, QUANPIN_TYPO_PENALTY_SCALE,
-    TYPO_ROWS_PER_KEY,
+    quanpin_touch_leads_correction, quanpin_touch_leads_correction_within,
+    quanpin_touch_supports_correction, segments_align_with_raw, EditWindowCache, PricedQuanpinTypo,
+    EDIT_WINDOW_CACHE_CAPACITY, QUANPIN_TYPO_PENALTY_SCALE, TYPO_ROWS_PER_KEY,
 };
 
 #[cfg(test)]
@@ -107,6 +108,8 @@ const ALTERNATIVE_SEGMENTATION_SEEN_CAPACITY: usize =
 /// 纠错整句扣掉罚分后每处纠错比字面整句高出这么多，就坐第一条整句后面（第二位），不再排到整句块之后。胜过得更多的（`typo_lead_margin`，50）坐首位。整句块有好几条读法，块后的纠错句在手机候选栏上常常看不到：xianziawodayoduanhua 的「现在我打一段话」高出字面整句很多，却排在三条不成句的读法后面。罚分折扣 0.25（`QUANPIN_TYPO_PENALTY_SCALE`）下，10396 条原句里出纠错整句的 702 条、每处高出的中位数 4.4，超过 20 的 38 条，其中字面整句本来就是原句的只有 2 条（坐第二位不动首选，只把第二条字面读法往后挪一格）；1812 条合法拼音打错集里超过 20 的 503 条。
 pub const TYPO_SECOND_SEAT_MARGIN: f64 = 20.0;
 const QUANPIN_TOUCH_LEAD_MARGIN: f64 = 12.0 * QUANPIN_TYPO_PENALTY_SCALE;
+const QUANPIN_BORDER_TOUCH_PENALTY: f64 = 13.6;
+const QUANPIN_BORDER_TOUCH_LEAD_MARGIN: f64 = 14.0;
 const TWO_SYLLABLE_TOUCH_PENALTY_CAP: f64 = 12.0;
 /// The masks whose lists depend on the typo profile and carry typo sentences.
 const TYPO_EDGE_TYPES: u32 = autocorrect_type::TRANSPOSITION
@@ -300,6 +303,7 @@ pub struct QuanpinDictionary {
     key_geometry: Option<Arc<KeyGeometry>>,
     touch_tuning: TouchTuning,
     lead_allowed: bool,
+    overlay: SharedUserOverlay,
 }
 
 impl QuanpinDictionary {
@@ -309,15 +313,34 @@ impl QuanpinDictionary {
     }
 
     /// Opens the generation's `msime-pinyin.db`, loads the n-gram tables, the personal context store and the typo profile off the keystroke path, and warms the statement cache (QD:231-268).
+    #[cfg(test)]
     pub fn new(paths: &RuntimePaths) -> Self {
-        let database = PinyinDatabase::open(&paths.dictionary(MAIN_DICTIONARY));
+        Self::new_with_options(paths, false, SharedUserOverlay::default())
+    }
+
+    pub fn new_with_options(
+        paths: &RuntimePaths,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
+        let database = PinyinDatabase::open_with_options(
+            &paths.dictionary(MAIN_DICTIONARY),
+            read_only,
+            overlay.clone(),
+        );
         database.warm_up();
         // 构造时预热并保留表；共享缓存淘汰不能让按键查询重新映射和检查整张表。
         let mut sentence_tables = SentenceNgramTables::load(paths);
         sentence_tables.set_offensive_words(database.offensive_words());
-        let journal = paths.user(USER_JOURNAL);
+        let journal = if read_only {
+            std::path::PathBuf::new()
+        } else {
+            paths.user(USER_JOURNAL)
+        };
         let personal = PersonalNgramStore::for_journal(&journal);
-        drop(personal.model());
+        if !read_only {
+            drop(personal.model());
+        }
         let personal_version = personal.version();
         let typo_profile = PersonalTypoProfile::shared(&journal);
         let typo_generation = typo_profile.generation();
@@ -367,6 +390,7 @@ impl QuanpinDictionary {
             key_geometry: None,
             touch_tuning: TouchTuning::default(),
             lead_allowed: false,
+            overlay,
         };
         dictionary.reset_cache_if_database_changed();
         dictionary
@@ -1016,6 +1040,9 @@ impl QuanpinDictionary {
         self.segmentation_cache.clear();
         self.fuzzy_cache.clear();
         self.typo_span_cache.clear();
+        if let Some(english) = &self.english_dictionary {
+            english.clear_cache();
+        }
         self.clear_row_caches();
     }
 
@@ -1291,11 +1318,13 @@ impl QuanpinDictionary {
             return;
         }
         let paths = &self.paths;
+        let overlay = &self.overlay;
         let english_dict = self.english_dictionary.get_or_insert_with(|| {
-            EnglishDictionary::open(
+            EnglishDictionary::open_with_overlay(
                 &paths.dictionary(crate::assets::ENGLISH_DICTIONARY),
                 Some(&paths.resource(crate::assets::TRANSLATIONS)),
                 Some(&paths.user(crate::assets::LEARNED_GLOSSES)),
+                overlay.clone(),
             )
         });
         let options = self.sentence_tables.options(self.sentence_alternatives);
@@ -2006,20 +2035,27 @@ impl QuanpinDictionary {
                     + (segments.len().saturating_sub(1) as f64) * options.phrase_length_bonus;
                 typo.score >= lit_equiv_50
             };
+            let seam_touch_leads = typo.leads(QUANPIN_TOUCH_LEAD_MARGIN)
+                && quanpin_touch_leads_correction(variants, &tuning, segments, &typo.key);
+            let border_touch_leads = typo.leads(QUANPIN_BORDER_TOUCH_LEAD_MARGIN)
+                && quanpin_touch_leads_correction_within(
+                    variants,
+                    tuning.show_penalty.min(QUANPIN_BORDER_TOUCH_PENALTY),
+                    segments,
+                    &typo.key,
+                );
             let leads_first = lead_allowed
                 && supported
                 && touches.iter().all(Option::is_some)
-                && typo.leads(QUANPIN_TOUCH_LEAD_MARGIN)
                 && outweighs_literal_word
-                && quanpin_touch_leads_correction(variants, &tuning, segments, &typo.key);
+                && (seam_touch_leads || border_touch_leads);
             (supported, leads_first)
         } else {
             (false, false)
         };
-        let neighbor_slip_leads = touched_slice.is_none()
+        let neighbor_slip_leads = (touched_slice.is_none() || (lead_allowed && touch_supported))
             && !raw.is_empty()
             && !raw.contains('\'')
-            && self.key_geometry.is_none()
             && at == 0
             && result.first().is_some_and(|literal| {
                 quanpin_neighbor_slip_leads(&self.database, segments, literal, &typo)

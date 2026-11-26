@@ -4,6 +4,7 @@ pub mod english;
 #[cfg(test)]
 mod fixtures;
 pub mod hanzi;
+pub mod overlay;
 pub mod pinyin;
 
 use rusqlite::types::ValueRef;

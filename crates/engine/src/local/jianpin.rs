@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use super::database::{lock, open_local_database};
 use super::LocalQueryResult;
 use crate::diagnostics;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::format;
 use crate::shuangpin::ShuangpinProfile;
 use crate::types::{CandidateSource, SchemeType, WordItem};
@@ -28,6 +29,24 @@ pub fn query_jianpin(
     limit: usize,
     profile: &ShuangpinProfile,
 ) -> LocalQueryResult {
+    query_jianpin_with_overlay(
+        code,
+        scheme,
+        main_db,
+        limit,
+        profile,
+        &SharedUserOverlay::default(),
+    )
+}
+
+pub fn query_jianpin_with_overlay(
+    code: &str,
+    scheme: SchemeType,
+    main_db: &Path,
+    limit: usize,
+    profile: &ShuangpinProfile,
+    overlay: &SharedUserOverlay,
+) -> LocalQueryResult {
     if limit == 0 {
         return LocalQueryResult::default();
     }
@@ -37,16 +56,73 @@ pub fn query_jianpin(
     let Some(table) = format::build_table_name(&initials) else {
         return LocalQueryResult::default();
     };
-    let Some(database) = open_local_database(main_db) else {
-        return LocalQueryResult::failure(diagnostics::SUPER_JIANPIN_UNAVAILABLE);
-    };
-    // A shuangpin key can expand to zh/ch/sh, but `jp` keeps only first letters, so Xiaohe `nu` (n'sh) and `ns` (n's) both select `jp = 'ns'`. Rows are filtered by their full initials after an oversized scan (jianpin_query.cpp:122-129, 188-189).
     let filter_initials = scheme == SchemeType::Shuangpin;
     let scan_limit = if filter_initials {
         limit.saturating_mul(32).max(512)
     } else {
         limit
     };
+    if overlay.has_pinyin() {
+        let guard = overlay.read();
+        if let Some(table_overlay) = guard.pinyin.get(&table) {
+            let fetch_limit = scan_limit.saturating_add(table_overlay.deleted.len());
+            let mut base = match open_local_database(main_db) {
+                Some(database) => match read(
+                    &lock(&database),
+                    &table,
+                    &initials,
+                    fetch_limit,
+                    limit.saturating_add(table_overlay.deleted.len()),
+                    filter_initials,
+                ) {
+                    Ok(candidates) => LocalQueryResult {
+                        candidates,
+                        diagnostic: None,
+                    },
+                    Err(_) => LocalQueryResult::failure(diagnostics::SUPER_JIANPIN_QUERY_FAILED),
+                },
+                None => LocalQueryResult::failure(diagnostics::SUPER_JIANPIN_UNAVAILABLE),
+            };
+            base.candidates.retain(|item| {
+                !table_overlay.is_deleted(&item.canonical_pinyin, &item.word)
+                    && !table_overlay.has_upsert(&item.canonical_pinyin, &item.word)
+            });
+            let jianpin: String = initials
+                .iter()
+                .filter_map(|initial| initial.get(..1))
+                .collect();
+            let matched_code = initials.join("'");
+            let mut merged: Vec<WordItem> = table_overlay
+                .upserts
+                .iter()
+                .filter(|row| {
+                    row.jp == jianpin
+                        && (!filter_initials || key_matches_initials(&row.key, &initials))
+                })
+                .map(|row| {
+                    WordItem::new(
+                        matched_code.clone(),
+                        row.value.clone(),
+                        row.weight,
+                        CandidateSource::Database,
+                        row.key.clone(),
+                    )
+                })
+                .collect();
+            merged.extend(base.candidates);
+            merged.sort_by_key(|item| std::cmp::Reverse(item.weight));
+            merged.truncate(limit);
+            base.candidates = merged;
+            if !base.candidates.is_empty() {
+                base.diagnostic = None;
+            }
+            return base;
+        }
+    }
+    let Some(database) = open_local_database(main_db) else {
+        return LocalQueryResult::failure(diagnostics::SUPER_JIANPIN_UNAVAILABLE);
+    };
+    // A shuangpin key can expand to zh/ch/sh, but `jp` keeps only first letters, so Xiaohe `nu` (n'sh) and `ns` (n's) both select `jp = 'ns'`. Rows are filtered by their full initials after an oversized scan (jianpin_query.cpp:122-129, 188-189).
     let rows = read(
         &lock(&database),
         &table,

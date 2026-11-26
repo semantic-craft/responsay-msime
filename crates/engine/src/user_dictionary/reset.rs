@@ -110,7 +110,13 @@ pub fn reset_auto_learned_journal(user_data: &Path) -> Result<()> {
 
 /// [`reset_learned_data`]，`main_dictionary` 为假（代次里没有 `msime-pinyin.db`，见 `SchemeSet::reads_main_dictionary`）时不要求也不复制 `msime-pinyin.db`，`msime-english.db` 在资源目录里有才换回，然后清空日志。不取维护租约，调用方（host 门面背后的 host-api）已经持有。
 pub fn reset_learned_data_with(paths: &RuntimePaths, main_dictionary: bool) -> Result<()> {
-    reset(paths, main_dictionary, main_dictionary, false, ResetMode::Full)
+    reset(
+        paths,
+        main_dictionary,
+        main_dictionary,
+        false,
+        ResetMode::Full,
+    )
 }
 
 /// `english_required` 为假时 `msime-english.db` 在资源目录里有才换回。`take_lease` 为真时自己取维护租约，持到换完为止。

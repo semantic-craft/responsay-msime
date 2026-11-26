@@ -322,16 +322,40 @@ pub struct ShuangpinEngine {
     profile: &'static ShuangpinProfile,
     dictionary: ShuangpinDictionary,
     paths: RuntimePaths,
+    read_only: bool,
+    overlay: crate::dictionary::overlay::SharedUserOverlay,
     /// Opened on the first fuzzy query only.
     fuzzy_dictionary: Option<QuanpinDictionary>,
 }
 
 impl ShuangpinEngine {
+    #[cfg(test)]
     pub fn new(profile: &'static ShuangpinProfile, paths: &RuntimePaths) -> Self {
+        Self::new_with_options(
+            profile,
+            paths,
+            false,
+            crate::dictionary::overlay::SharedUserOverlay::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        profile: &'static ShuangpinProfile,
+        paths: &RuntimePaths,
+        read_only: bool,
+        overlay: crate::dictionary::overlay::SharedUserOverlay,
+    ) -> Self {
         Self {
             profile,
-            dictionary: ShuangpinDictionary::new(profile, paths),
+            dictionary: ShuangpinDictionary::new_with_options(
+                profile,
+                paths,
+                read_only,
+                overlay.clone(),
+            ),
             paths: paths.clone(),
+            read_only,
+            overlay,
             fuzzy_dictionary: None,
         }
     }
@@ -706,9 +730,11 @@ impl ShuangpinEngine {
             return exact;
         }
         let paths = &self.paths;
-        let fuzzy_dictionary = self
-            .fuzzy_dictionary
-            .get_or_insert_with(|| QuanpinDictionary::new(paths));
+        let read_only = self.read_only;
+        let overlay = &self.overlay;
+        let fuzzy_dictionary = self.fuzzy_dictionary.get_or_insert_with(|| {
+            QuanpinDictionary::new_with_options(paths, read_only, overlay.clone())
+        });
         let mut fuzzy = fuzzy_dictionary.fuzzy_candidates(
             &to_quanpin_segmentation(raw_segmentation, self.profile),
             options,

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::lattice::offensive::{is_offensive_english, OffensiveWords};
 use crate::offensive_placement::{grid_demotion, keep_off_first_page};
 use crate::types::WordItem;
@@ -33,6 +34,7 @@ pub(crate) fn seat_nine_key_english(
     mut english: Vec<WordItem>,
     typed: usize,
     journal: &Path,
+    overlay: &SharedUserOverlay,
     first_page_count: usize,
     first_page_rows: usize,
 ) {
@@ -47,7 +49,9 @@ pub(crate) fn seat_nine_key_english(
         let (mut seated, rest): (Vec<WordItem>, Vec<WordItem>) =
             english.into_iter().partition(|word| {
                 takes_priority_slot_or_own(word, |word| {
-                    word.pinyin.len() == typed && has_english_upsert(journal, &word.pinyin)
+                    word.pinyin.len() == typed
+                        && (overlay.has_english_word(&word.pinyin)
+                            || has_english_upsert(journal, &word.pinyin))
                 })
             });
         let count = seated.len();

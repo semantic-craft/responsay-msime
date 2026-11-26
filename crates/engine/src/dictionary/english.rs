@@ -8,7 +8,7 @@ pub(crate) use priority_slot::{
 };
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use std::time::Duration;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
+use super::overlay::SharedUserOverlay;
 use super::{column_i64, column_text, sql_limit};
 use crate::assets;
 use crate::error::Result;
@@ -63,11 +64,27 @@ pub struct EnglishDictionary {
     gloss_cache: Option<PathBuf>,
     /// The learned-gloss store, opened on the first lookup that reaches it and retried while the file does not exist yet: nothing may have been learned when the dictionary opens (english_dictionary.cpp:363-386).
     gloss_cache_connection: RefCell<Option<Connection>>,
+    overlay: SharedUserOverlay,
+    overlay_generation: Cell<u64>,
 }
 
 impl EnglishDictionary {
     /// Read-only; never creates or migrates the file. `translations` defaults to `custom_translations.txt` beside the database when `None`. `gloss_cache` is the learned-gloss database, read-only and never created on read.
     pub fn open(database: &Path, translations: Option<&Path>, gloss_cache: Option<&Path>) -> Self {
+        Self::open_with_overlay(
+            database,
+            translations,
+            gloss_cache,
+            SharedUserOverlay::default(),
+        )
+    }
+
+    pub fn open_with_overlay(
+        database: &Path,
+        translations: Option<&Path>,
+        gloss_cache: Option<&Path>,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         // The reference spelled "no path" as an empty string, and `RuntimePaths` still yields empty paths for missing roots, so an empty path means the default here too.
         let translations = translations.filter(|path| !path.as_os_str().is_empty());
         let gloss_cache = gloss_cache
@@ -88,17 +105,32 @@ impl EnglishDictionary {
             );
             load_custom_translations(&sidecar)
         };
+        let overlay_generation = overlay.generation();
         Self {
             connection: open_prefix_connection(database),
             correction_cache: RefCell::default(),
             translations,
             gloss_cache,
             gloss_cache_connection: RefCell::new(None),
+            overlay,
+            overlay_generation: Cell::new(overlay_generation),
         }
     }
 
+    pub(super) fn sync_overlay_cache(&self) {
+        let current = self.overlay.generation();
+        if current != self.overlay_generation.get() {
+            self.overlay_generation.set(current);
+            self.correction_cache.borrow_mut().clear();
+        }
+    }
+
+    pub fn clear_cache(&self) {
+        self.correction_cache.borrow_mut().clear();
+    }
+
     pub fn ready(&self) -> bool {
-        self.connection.is_some()
+        self.connection.is_some() || self.overlay.has_english()
     }
 
     /// Exact word first, then weight, then shorter, then word and display (english_dictionary.cpp:39-81). Rows are `WordItem(pinyin = word, word = display, weight, EnglishDictionary)`. Empty unless the prefix is non-empty `a..=z`.
@@ -110,8 +142,22 @@ impl EnglishDictionary {
 
     /// 短英文混输只取完整拼写中权重最高的显示形式，避免扫描和排序整个前缀范围。
     pub(crate) fn query_exact(&self, word: &str) -> Option<WordItem> {
+        self.sync_overlay_cache();
         if !is_lower_ascii_word(word) {
             return None;
+        }
+        if self.overlay.has_english() {
+            return self
+                .best_exact_row_filtered(word, |display| !display.is_empty())
+                .map(|(display, weight)| {
+                    WordItem::new(
+                        word,
+                        display,
+                        weight,
+                        CandidateSource::EnglishDictionary,
+                        "",
+                    )
+                });
         }
         self.connection
             .as_ref()?
@@ -123,17 +169,153 @@ impl EnglishDictionary {
             .ok()
     }
 
+    pub(super) fn best_exact_row_filtered(
+        &self,
+        word: &str,
+        accept_display: impl Fn(&str) -> bool,
+    ) -> Option<(String, i64)> {
+        if self.overlay.has_english() {
+            let guard = self.overlay.read();
+            let english = &guard.english;
+            let mut best: Option<(String, i64)> = None;
+            let mut consider = |display: String, weight: i64| {
+                if !accept_display(&display) {
+                    return;
+                }
+                let replace = match &best {
+                    None => true,
+                    Some((cur_disp, cur_w)) => {
+                        weight > *cur_w || (weight == *cur_w && display < *cur_disp)
+                    }
+                };
+                if replace {
+                    best = Some((display, weight));
+                }
+            };
+            for row in &english.upserts {
+                if row.word == word {
+                    consider(row.display.clone(), row.weight);
+                }
+            }
+            if let Some(connection) = &self.connection {
+                if let Ok(mut stmt) = connection.prepare_cached(
+                    "SELECT display,weight FROM english_words WHERE word=?1 AND display IS NOT NULL ORDER BY weight DESC,display",
+                ) {
+                    if let Ok(mut rows) = stmt.query([word]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let (Ok(display), Ok(weight)) = (column_text(row, 0), column_i64(row, 1)) else {
+                                break;
+                            };
+                            if english.is_deleted(word, &display)
+                                || english.has_upsert(word, &display)
+                            {
+                                continue;
+                            }
+                            if accept_display(&display) {
+                                consider(display, weight);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return best;
+        }
+        let connection = self.connection.as_ref()?;
+        let mut stmt = connection
+            .prepare_cached(
+                "SELECT display,weight FROM english_words WHERE word=?1 AND display IS NOT NULL ORDER BY weight DESC,display",
+            )
+            .ok()?;
+        let mut rows = stmt.query([word]).ok()?;
+        while let Some(row) = rows.next().ok()? {
+            let display = column_text(row, 0).ok()?;
+            let weight = column_i64(row, 1).ok()?;
+            if accept_display(&display) {
+                return Some((display, weight));
+            }
+        }
+        None
+    }
+
     /// 向已有候选缓冲写入结果；热查询复用候选行和其中的字符串容量。
     pub fn query_prefix_into(&self, prefix: &str, limit: usize, candidates: &mut Vec<WordItem>) {
-        let Some(connection) = &self.connection else {
-            candidates.clear();
-            return;
-        };
-        if !is_lower_ascii_word(prefix) || limit == 0 {
+        self.sync_overlay_cache();
+        if (self.connection.is_none() && !self.overlay.has_english())
+            || !is_lower_ascii_word(prefix)
+            || limit == 0
+        {
             candidates.clear();
             return;
         }
         let upper_bound = prefix_upper_bound(prefix);
+        if self.overlay.has_english() {
+            let guard = self.overlay.read();
+            let english = &guard.english;
+            let mut merged: Vec<(String, String, i64)> = english
+                .upserts
+                .iter()
+                .filter(|row| {
+                    is_lower_ascii_word(&row.word)
+                        && row.word.as_str() >= prefix
+                        && row.word.as_str() < upper_bound.as_str()
+                })
+                .map(|row| (row.word.clone(), row.display.clone(), row.weight))
+                .collect();
+            if let Some(connection) = &self.connection {
+                let fetch_limit = limit.saturating_add(english.deleted.len());
+                if let Ok(mut statement) =
+                    connection.prepare_cached(&prefix_sql(sql_limit(fetch_limit)))
+                {
+                    if let Ok(mut rows) = statement.query([prefix, upper_bound.as_str()]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let is_null = |index| matches!(row.get_ref(index), Ok(ValueRef::Null));
+                            if is_null(0) || is_null(1) {
+                                continue;
+                            }
+                            let (Ok(word), Ok(display), Ok(weight)) = (
+                                column_text_ref(row, 0),
+                                column_text_ref(row, 1),
+                                column_i64(row, 2),
+                            ) else {
+                                break;
+                            };
+                            if english.is_deleted(&word, &display)
+                                || english.has_upsert(&word, &display)
+                            {
+                                continue;
+                            }
+                            merged.push((word.into_owned(), display.into_owned(), weight));
+                        }
+                    }
+                }
+            }
+            merged.sort_by(|left, right| {
+                (left.0 != prefix)
+                    .cmp(&(right.0 != prefix))
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| left.0.len().cmp(&right.0.len()))
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            merged.truncate(limit);
+            candidates.clear();
+            candidates.reserve(merged.len());
+            for (word, display, weight) in merged {
+                candidates.push(WordItem::new(
+                    word,
+                    display,
+                    weight,
+                    CandidateSource::EnglishDictionary,
+                    "",
+                ));
+            }
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            candidates.clear();
+            return;
+        };
         let Ok(mut statement) = connection.prepare_cached(&prefix_sql(sql_limit(limit))) else {
             candidates.clear();
             return;
@@ -155,13 +337,86 @@ impl EnglishDictionary {
         candidates: &mut Vec<WordItem>,
         capacity: usize,
     ) {
-        let Some(connection) = &self.connection else {
-            return;
-        };
+        self.sync_overlay_cache();
         if !is_lower_ascii_word(prefix) || pattern.is_empty() || limit == 0 {
             return;
         }
         let upper_bound = prefix_upper_bound(prefix);
+        if self.overlay.has_english() {
+            let guard = self.overlay.read();
+            let english = &guard.english;
+            let mut merged: Vec<KeypadRow> = english
+                .upserts
+                .iter()
+                .filter(|row| {
+                    row.word.as_str() >= prefix
+                        && row.word.as_str() < upper_bound.as_str()
+                        && row.word.bytes().all(|b| b.is_ascii_alphabetic())
+                        && !row.word.contains('\0')
+                        && ascii_glob_matches(pattern.as_bytes(), row.word.as_bytes())
+                })
+                .map(|row| KeypadRow {
+                    word: row.word.clone(),
+                    display_bytes: row.display.len(),
+                    display: row.display.clone(),
+                    weight: row.weight,
+                    positive: row.weight > 0,
+                })
+                .collect();
+            if let Some(connection) = &self.connection {
+                let fetch_limit = limit.saturating_add(english.deleted.len());
+                let sql = format!("{KEYPAD_PREFIX_SQL}{}", sql_limit(fetch_limit));
+                if let Ok(mut statement) = connection.prepare_cached(&sql) {
+                    if let Ok(mut rows) = statement.query(rusqlite::params![
+                        prefix,
+                        upper_bound,
+                        pattern,
+                        sql_limit(typed)
+                    ]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let is_null = |index| matches!(row.get_ref(index), Ok(ValueRef::Null));
+                            if is_null(0) || is_null(1) {
+                                continue;
+                            }
+                            let (Ok(word), Ok(display), Ok(weight)) = (
+                                column_text_ref(row, 0),
+                                column_text_ref(row, 1),
+                                column_i64(row, 2),
+                            ) else {
+                                break;
+                            };
+                            if english.is_deleted(&word, &display)
+                                || english.has_upsert(&word, &display)
+                            {
+                                continue;
+                            }
+                            merged.push(KeypadRow {
+                                word: word.into_owned(),
+                                display_bytes: display.len(),
+                                display: display.into_owned(),
+                                weight,
+                                positive: weight > 0,
+                            });
+                        }
+                    }
+                }
+            }
+            merged.sort_by(|left, right| {
+                right
+                    .weight
+                    .cmp(&left.weight)
+                    .then_with(|| left.display_bytes.cmp(&right.display_bytes))
+                    .then_with(|| (left.word != prefix).cmp(&(right.word != prefix)))
+                    .then_with(|| left.word.len().cmp(&right.word.len()))
+                    .then_with(|| left.word.cmp(&right.word))
+                    .then_with(|| left.display.cmp(&right.display))
+            });
+            append_keypad_ranked(&merged, typed, limit, candidates, capacity);
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            return;
+        };
         let sql = format!("{KEYPAD_PREFIX_SQL}{}", sql_limit(limit));
         let Ok(mut statement) = connection.prepare_cached(&sql) else {
             return;
@@ -184,11 +439,81 @@ impl EnglishDictionary {
         pattern: &str,
         limit: usize,
     ) -> Option<Vec<KeypadRow>> {
-        let connection = self.connection.as_ref()?;
+        self.sync_overlay_cache();
         if !is_lower_ascii_word(prefix) || pattern.is_empty() {
             return None;
         }
         let upper_bound = prefix_upper_bound(prefix);
+        if self.overlay.has_english() {
+            let guard = self.overlay.read();
+            let english = &guard.english;
+            let mut result: Vec<KeypadRow> = english
+                .upserts
+                .iter()
+                .filter(|row| {
+                    row.word.as_str() >= prefix
+                        && row.word.as_str() < upper_bound.as_str()
+                        && row.word.bytes().all(|b| b.is_ascii_alphabetic())
+                        && !row.word.contains('\0')
+                        && ascii_glob_matches(pattern.as_bytes(), row.word.as_bytes())
+                })
+                .map(|row| KeypadRow {
+                    word: row.word.clone(),
+                    display_bytes: row.display.len(),
+                    display: row.display.clone(),
+                    weight: row.weight,
+                    positive: row.weight > 0,
+                })
+                .collect();
+            if result.len() > limit {
+                return None;
+            }
+            if let Some(connection) = &self.connection {
+                let fetch_limit = limit
+                    .saturating_add(english.deleted.len())
+                    .saturating_add(1);
+                let sql = format!("{KEYPAD_PREFIX_ROWS_SQL}{}", sql_limit(fetch_limit));
+                let mut statement = connection.prepare_cached(&sql).ok()?;
+                let mut rows = statement
+                    .query(rusqlite::params![prefix, upper_bound, pattern])
+                    .ok()?;
+                while let Some(row) = rows.next().ok()? {
+                    let is_null = |index| matches!(row.get_ref(index), Ok(ValueRef::Null));
+                    if is_null(0) || is_null(1) {
+                        continue;
+                    }
+                    let word = column_text_ref(row, 0).ok()?.into_owned();
+                    let display = column_text_ref(row, 1).ok()?.into_owned();
+                    if english.is_deleted(&word, &display) || english.has_upsert(&word, &display) {
+                        continue;
+                    }
+                    if result.len() == limit {
+                        return None;
+                    }
+                    result.push(KeypadRow {
+                        word,
+                        display,
+                        weight: column_i64(row, 2).ok()?,
+                        display_bytes: usize::try_from(column_i64(row, 3).ok()?).ok()?,
+                        positive: column_i64(row, 4).ok()? != 0,
+                    });
+                }
+            } else if result.is_empty() {
+                return None;
+            }
+            result.sort_by(|left, right| {
+                right
+                    .weight
+                    .cmp(&left.weight)
+                    .then_with(|| left.display_bytes.cmp(&right.display_bytes))
+                    .then_with(|| (left.word != prefix).cmp(&(right.word != prefix)))
+                    .then_with(|| left.word.len().cmp(&right.word.len()))
+                    .then_with(|| left.word.cmp(&right.word))
+                    .then_with(|| left.display.cmp(&right.display))
+            });
+            return Some(result);
+        }
+        let connection = self.connection.as_ref()?;
         let sql = format!(
             "{KEYPAD_PREFIX_ROWS_SQL}{}",
             sql_limit(limit.saturating_add(1))
@@ -536,10 +861,79 @@ pub fn load_custom_translations(path: &Path) -> CustomTranslations {
 /// Opens the dictionary and checks the prefix statement prepares, which is what the reference's `ready()` meant: a file without `english_words` is not a dictionary (english_dictionary.cpp:317-343).
 fn open_prefix_connection(path: &Path) -> Option<Connection> {
     let connection = open_read_only(path)?;
+    connection.set_prepared_statement_cache_capacity(64);
+    let _ = connection.pragma_update(None, "mmap_size", 128 * 1024 * 1024_i64);
     if connection.prepare(&prefix_sql(1)).is_err() {
         return None;
     }
     Some(connection)
+}
+
+fn ascii_glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, t));
+            p += 1;
+            continue;
+        }
+        if let Some((next_p, matched)) = glob_step(pattern, p, text[t]) {
+            if matched {
+                p = next_p;
+                t += 1;
+                continue;
+            }
+        }
+        if let Some((sp, st)) = star {
+            p = sp + 1;
+            t = st + 1;
+            star = Some((sp, t));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn glob_step(pattern: &[u8], pos: usize, ch: u8) -> Option<(usize, bool)> {
+    let first = *pattern.get(pos)?;
+    if first == b'?' {
+        return Some((pos + 1, true));
+    }
+    if first != b'[' {
+        return Some((pos + 1, first == ch));
+    }
+    let mut cur = pos + 1;
+    let negated = pattern.get(cur) == Some(&b'^');
+    if negated {
+        cur += 1;
+    }
+    let mut matched = false;
+    let mut saw_any = false;
+    while cur < pattern.len() {
+        let b = pattern[cur];
+        if b == b']' && saw_any {
+            return Some((cur + 1, matched ^ negated));
+        }
+        saw_any = true;
+        if cur + 2 < pattern.len() && pattern[cur + 1] == b'-' && pattern[cur + 2] != b']' {
+            let end = pattern[cur + 2];
+            if (b..=end).contains(&ch) {
+                matched = true;
+            }
+            cur += 3;
+        } else {
+            if b == ch {
+                matched = true;
+            }
+            cur += 1;
+        }
+    }
+    None
 }
 
 fn prefix_sql(limit: i64) -> String {

@@ -1002,6 +1002,15 @@ pub(crate) fn quanpin_touch_leads_correction(
     segments: &[String],
     corrected_key: &str,
 ) -> bool {
+    quanpin_touch_leads_correction_within(variants, tuning.lead_penalty, segments, corrected_key)
+}
+
+pub(crate) fn quanpin_touch_leads_correction_within(
+    variants: &[Vec<PricedQuanpinTypo>],
+    max_raw_penalty: f64,
+    segments: &[String],
+    corrected_key: &str,
+) -> bool {
     let corrected: Vec<&str> = corrected_key.split('\'').collect();
     if corrected.len() != segments.len() || variants.len() != segments.len() {
         return false;
@@ -1016,7 +1025,7 @@ pub(crate) fn quanpin_touch_leads_correction(
         if !pos_variants.iter().any(|v| {
             v.syllable == corr
                 && v.neighbor_raw_penalty
-                    .is_some_and(|raw_p| raw_p <= tuning.lead_penalty)
+                    .is_some_and(|raw_p| raw_p <= max_raw_penalty)
         }) {
             return false;
         }

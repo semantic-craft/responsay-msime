@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{params_from_iter, Connection, OpenFlags, Row};
 
+use super::overlay::{PinyinOverlayRow, PinyinTableOverlay, SharedUserOverlay};
 use super::{column_i64, column_text, sql_limit, DictRow};
 use crate::error::{EngineError, Result};
 use crate::format::{
@@ -49,22 +50,37 @@ const INVALID_DICTIONARY_KEY: &str = "Invalid pinyin dictionary key";
 pub struct PinyinDatabase {
     connection: Option<Connection>,
     data_version: Option<i64>,
+    overlay: SharedUserOverlay,
+    overlay_generation: u64,
 }
 
 impl PinyinDatabase {
     /// READWRITE without CREATE, busy timeout 250 ms (QD:239-246). A missing file leaves the database closed and every query empty.
+    #[cfg(test)]
     pub fn open(path: &Path) -> Self {
+        Self::open_with_options(path, false, SharedUserOverlay::default())
+    }
+
+    pub fn open_with_options(path: &Path, read_only: bool, overlay: SharedUserOverlay) -> Self {
+        let overlay_generation = overlay.generation();
+        let connection = if read_only {
+            open_read_only_connection(path)
+        } else {
+            open_connection(path)
+        };
         let mut database = Self {
-            connection: open_connection(path),
+            connection,
             data_version: None,
+            overlay,
+            overlay_generation,
         };
         // The reference constructor records the version, so the first poll after opening already compares (QD:268).
-        database.database_changed();
+        let _ = database.sqlite_data_version_changed();
         database
     }
 
     pub fn is_open(&self) -> bool {
-        self.connection.is_some()
+        self.connection.is_some() || self.overlay.has_pinyin()
     }
 
     /// 这个词库的粗俗词表：带 `sentence_excluded` 表时用它，否则（没打开、旧词库没有这张表、表读不出来）用编进引擎的表，见 `lattice::offensive`。
@@ -77,6 +93,14 @@ impl PinyinDatabase {
 
     /// Whether `PRAGMA data_version` moved since the last call, meaning another connection wrote the file and cached answers are stale (QD:1409-1432). The first call records the version and answers false.
     pub fn database_changed(&mut self) -> bool {
+        let current_overlay = self.overlay.generation();
+        let overlay_changed = current_overlay != self.overlay_generation;
+        self.overlay_generation = current_overlay;
+        let sqlite_changed = self.sqlite_data_version_changed();
+        overlay_changed || sqlite_changed
+    }
+
+    fn sqlite_data_version_changed(&mut self) -> bool {
         let Some(connection) = &self.connection else {
             return false;
         };
@@ -141,7 +165,7 @@ impl PinyinDatabase {
         limit: usize,
         source: QuerySource,
     ) -> Vec<DictRow> {
-        if self.connection.is_none() || segments.is_empty() || limit == 0 {
+        if !self.is_open() || segments.is_empty() || limit == 0 {
             return Vec::new();
         }
         let rows = self.query_single_cut_keyed(segments, limit, source);
@@ -154,7 +178,7 @@ impl PinyinDatabase {
         segments: &[String],
         limit: usize,
     ) -> Vec<DictRow> {
-        if self.connection.is_none() || segments.is_empty() || limit == 0 {
+        if !self.is_open() || segments.is_empty() || limit == 0 {
             return Vec::new();
         }
         let rows = self.query_fixed_tail_single_cut_keyed(segments, limit);
@@ -169,9 +193,23 @@ impl PinyinDatabase {
         if !first.is_ascii_lowercase() || limit == 0 {
             return Vec::new();
         }
+        let upper_bound = key_prefix_upper_bound(prefix);
+        if self.overlay.has_pinyin() {
+            if let Some(table) = quanpin_table(1, first) {
+                let guard = self.overlay.read();
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                    let sql = initial_sql(first, sql_limit(fetch_limit));
+                    let base =
+                        self.rows(&sql, [prefix, upper_bound.as_str()], query_capacity(limit));
+                    return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                        row.key.as_str() >= prefix && row.key.as_str() < upper_bound.as_str()
+                    });
+                }
+            }
+        }
         let sql = initial_sql(first, sql_limit(limit));
         // The upper bound is written out here in the reference too (QQ:1083).
-        let upper_bound = key_prefix_upper_bound(prefix);
         self.rows(&sql, [prefix, upper_bound.as_str()], query_capacity(limit))
     }
 
@@ -182,7 +220,7 @@ impl PinyinDatabase {
         extra_syllables: usize,
         limit: usize,
     ) -> Vec<DictRow> {
-        if self.connection.is_none()
+        if !self.is_open()
             || segments.len() < 2
             || extra_syllables == 0
             || limit == 0
@@ -198,15 +236,39 @@ impl PinyinDatabase {
         let upper_bound = key_prefix_upper_bound(&prefix);
         let initial = segments[0].as_bytes()[0];
         let mut rows = Vec::new();
+        let has_overlay = self.overlay.has_pinyin();
         for extra in 1..=pages {
             let Some(table) = quanpin_table(segments.len() + extra, initial) else {
                 continue;
             };
-            let page = self.rows(
-                &range_sql(&table, sql_limit(limit)),
-                [prefix.as_str(), upper_bound.as_str()],
-                query_capacity(limit),
-            );
+            let page = if has_overlay {
+                let guard = self.overlay.read();
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                    let base = self.rows(
+                        &range_sql(&table, sql_limit(fetch_limit)),
+                        [prefix.as_str(), upper_bound.as_str()],
+                        query_capacity(limit),
+                    );
+                    merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                        row.key.as_str() >= prefix.as_str()
+                            && row.key.as_str() < upper_bound.as_str()
+                    })
+                } else {
+                    drop(guard);
+                    self.rows(
+                        &range_sql(&table, sql_limit(limit)),
+                        [prefix.as_str(), upper_bound.as_str()],
+                        query_capacity(limit),
+                    )
+                }
+            } else {
+                self.rows(
+                    &range_sql(&table, sql_limit(limit)),
+                    [prefix.as_str(), upper_bound.as_str()],
+                    query_capacity(limit),
+                )
+            };
             if !page.is_empty() {
                 if rows.is_empty() && page.len() == limit {
                     // 首个非空页直接接管，避免再分配并搬移一份相同的行存储。
@@ -239,7 +301,7 @@ impl PinyinDatabase {
     /// 上屏后的词库续词：先限定完整读音和汉字前缀，再按权重取未上屏的后缀。只遍历对应的索引范围，不反查整份词库。
     pub fn query_next_words(&self, word: &str, pinyin: &str, limit: usize) -> Vec<DictRow> {
         let segments: Vec<String> = pinyin.split('\'').map(str::to_owned).collect();
-        if self.connection.is_none()
+        if !self.is_open()
             || !crate::text::is_all_han(word)
             || segments.len() != word.chars().count()
             || !has_only_complete_pinyin_segments(&segments)
@@ -252,11 +314,48 @@ impl PinyinDatabase {
         let upper = key_prefix_upper_bound(&prefix);
         let initial = segments[0].as_bytes()[0];
         let mut result = Vec::new();
+        let has_overlay = self.overlay.has_pinyin();
+        let char_count = word.chars().count() as i64;
         // 编号表之后只有一个溢出桶；同一词面有多条读音时在 LIMIT 前去重，避免吞掉后面的建议。
         for size in segments.len() + 1..=MAXIMUM_NUMBERED_SYLLABLES.max(segments.len()) + 1 {
             let Some(table) = quanpin_table(size, initial) else {
                 continue;
             };
+            if has_overlay {
+                let guard = self.overlay.read();
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                    let sql = format!(
+                        "SELECT key, value, weight FROM \"{table}\" \
+                         WHERE key>=?1 AND key<?2 AND substr(value,1,?3)=?4 \
+                         AND length(value)>?3 ORDER BY weight DESC, value LIMIT ?5"
+                    );
+                    let base = self.rows(
+                        &sql,
+                        rusqlite::params![prefix, upper, char_count, word, fetch_limit as i64],
+                        Some(limit),
+                    );
+                    let merged =
+                        merge_pinyin_overlay_rows(base, table_overlay, usize::MAX, |row| {
+                            row.key.as_str() >= prefix.as_str()
+                                && row.key.as_str() < upper.as_str()
+                                && row.value.starts_with(word)
+                                && row.value.len() > word.len()
+                        });
+                    for mut row in merged {
+                        let Some(suffix) = row.value.strip_prefix(word) else {
+                            continue;
+                        };
+                        if !crate::text::is_all_han(suffix) {
+                            continue;
+                        }
+                        row.value = suffix.to_owned();
+                        row.key = row.key.strip_prefix(&prefix).unwrap_or_default().to_owned();
+                        result.push(row);
+                    }
+                    continue;
+                }
+            }
             let sql = format!(
                 "SELECT MIN(key), value, MAX(weight) FROM \"{table}\" \
                  WHERE key>=?1 AND key<?2 AND substr(value,1,?3)=?4 \
@@ -264,13 +363,7 @@ impl PinyinDatabase {
             );
             for mut row in self.rows(
                 &sql,
-                rusqlite::params![
-                    prefix,
-                    upper,
-                    word.chars().count() as i64,
-                    word,
-                    limit as i64
-                ],
+                rusqlite::params![prefix, upper, char_count, word, limit as i64],
                 Some(limit),
             ) {
                 let Some(suffix) = row.value.strip_prefix(word) else {
@@ -301,7 +394,7 @@ impl PinyinDatabase {
         segmentations: &[Vec<String>],
         limit: usize,
     ) -> Vec<DictRow> {
-        if self.connection.is_none() || segmentations.is_empty() || limit == 0 {
+        if !self.is_open() || segmentations.is_empty() || limit == 0 {
             return Vec::new();
         }
         let keys_by_table = exact_segmentations_by_table(segmentations);
@@ -345,7 +438,7 @@ impl PinyinDatabase {
         per_key_limit: usize,
     ) -> HashMap<String, Vec<DictRow>> {
         let mut result: HashMap<String, Vec<DictRow>> = HashMap::new();
-        if self.connection.is_none() || keys.is_empty() || per_key_limit == 0 {
+        if !self.is_open() || keys.is_empty() || per_key_limit == 0 {
             return result;
         }
         let mut keys_by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
@@ -359,11 +452,7 @@ impl PinyinDatabase {
                 continue;
             };
             if syllables == 1 {
-                let rows = self.rows(
-                    &exact_sql(&table, sql_limit(per_key_limit)),
-                    [key.as_str()],
-                    query_capacity(per_key_limit),
-                );
+                let rows = self.exact_table_rows(&table, key.as_str(), per_key_limit);
                 if !rows.is_empty() {
                     if result.capacity() == 0 {
                         result.reserve(keys.len());
@@ -410,7 +499,7 @@ impl PinyinDatabase {
         codes: &[String],
         table_limit: usize,
     ) -> Vec<DictRow> {
-        if self.connection.is_none() || codes.is_empty() || table_limit == 0 {
+        if !self.is_open() || codes.is_empty() || table_limit == 0 {
             return Vec::new();
         }
         let mut codes_by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
@@ -427,7 +516,30 @@ impl PinyinDatabase {
             }
         }
         let mut rows = Vec::new();
+        let has_overlay = self.overlay.has_pinyin();
         for (table, table_codes) in &codes_by_table {
+            if has_overlay {
+                let guard = self.overlay.read();
+                if let Some(table_overlay) = guard.pinyin.get(table) {
+                    let fetch_limit = table_limit.saturating_add(table_overlay.deleted.len());
+                    let sql = jianpin_batch_sql(table, table_codes.len(), sql_limit(fetch_limit));
+                    let base = self.rows(
+                        &sql,
+                        params_from_iter(table_codes),
+                        query_capacity(table_limit),
+                    );
+                    let page = merge_pinyin_overlay_rows(base, table_overlay, table_limit, |row| {
+                        table_codes.contains(&row.jp.as_str())
+                    });
+                    if !page.is_empty() {
+                        if rows.capacity() == 0 {
+                            rows.reserve_exact(table_limit.min(128));
+                        }
+                        rows.extend(page);
+                    }
+                    continue;
+                }
+            }
             let sql = jianpin_batch_sql(table, table_codes.len(), sql_limit(table_limit));
             let mut inline = [const { None }; INLINE_JIANPIN_ROWS];
             let mut inline_len = 0;
@@ -464,7 +576,7 @@ impl PinyinDatabase {
 
     /// 词网格跨度逐音节规范化后只查精确键，`gun'qi` 不会借用 `gun'qiu` 的行（QQ:1398-1418）。
     pub fn query_lattice_span(&self, span: &[String], span_limit: usize) -> Vec<DictRow> {
-        if self.connection.is_none() || span.is_empty() || span_limit == 0 {
+        if !self.is_open() || span.is_empty() || span_limit == 0 {
             return Vec::new();
         }
         let normalized = span
@@ -501,7 +613,7 @@ impl PinyinDatabase {
         span: &[String],
         span_limit: usize,
     ) -> Vec<DictRow> {
-        if self.connection.is_none() || span.is_empty() || span_limit == 0 {
+        if !self.is_open() || span.is_empty() || span_limit == 0 {
             return Vec::new();
         }
         if has_only_complete_pinyin_segments(span) {
@@ -525,7 +637,7 @@ impl PinyinDatabase {
         let Some((initial, leading)) = span.split_last() else {
             return Vec::new();
         };
-        if self.connection.is_none()
+        if !self.is_open()
             || span_limit == 0
             || is_intact(initial)
             || extract_initial_token(initial) != initial
@@ -558,12 +670,58 @@ impl PinyinDatabase {
 
     /// Whether any shipped single-character table holds `han` (QQ:1017-1050).
     pub fn han_char_exists(&self, han: &str) -> bool {
+        if han.is_empty() || !self.is_open() {
+            return false;
+        }
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            for initial in SHIPPED_INITIALS.bytes() {
+                let Some(table) = quanpin_table(1, initial) else {
+                    continue;
+                };
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    if table_overlay.upserts.iter().any(|row| row.value == han) {
+                        return true;
+                    }
+                }
+            }
+            let Some(connection) = &self.connection else {
+                return false;
+            };
+            return SHIPPED_INITIALS.bytes().any(|initial| {
+                let Some(table) = quanpin_table(1, initial) else {
+                    return false;
+                };
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    if !table_overlay.deleted.is_empty() {
+                        let sql = format!("SELECT key FROM \"{table}\" WHERE value=?1");
+                        let Ok(mut stmt) = connection.prepare_cached(&sql) else {
+                            return false;
+                        };
+                        let Ok(mut rows) = stmt.query((han,)) else {
+                            return false;
+                        };
+                        while let Ok(Some(row)) = rows.next() {
+                            if let Ok(key) = column_text(row, 0) {
+                                if !table_overlay.is_deleted(&key, han) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                }
+                let Ok(mut statement) =
+                    connection.prepare_cached(&han_char_exists_sql(table.as_str()))
+                else {
+                    return false;
+                };
+                statement.exists((han,)).unwrap_or(false)
+            });
+        }
         let Some(connection) = &self.connection else {
             return false;
         };
-        if han.is_empty() {
-            return false;
-        }
         SHIPPED_INITIALS.bytes().any(|initial| {
             let Some(table) = quanpin_table(1, initial) else {
                 return false;
@@ -579,8 +737,19 @@ impl PinyinDatabase {
 
     /// 按原键的段数选表，查询 `key` 与 `value` 的首行权重（QD:484-499）。
     pub fn find_weight(&self, key: &str, value: &str) -> Option<i64> {
-        let connection = self.connection.as_ref()?;
         let (table, _) = word_key_table(key)?;
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(&table) {
+                if table_overlay.is_deleted(key, value) {
+                    return None;
+                }
+                if let Some(weight) = table_overlay.find_upsert_weight(key, value) {
+                    return Some(weight);
+                }
+            }
+        }
+        let connection = self.connection.as_ref()?;
         // 缺表或首步失败沿用参考实现的未找到结果（QD:490-497）。
         let mut statement = connection.prepare_cached(&find_weight_sql(&table)).ok()?;
         let mut rows = statement.query((key, value)).ok()?;
@@ -604,6 +773,8 @@ impl PinyinDatabase {
         let database = Self {
             connection: Some(connection),
             data_version: None,
+            overlay: SharedUserOverlay::default(),
+            overlay_generation: 0,
         };
         database.find_weight(key, value).is_some()
     }
@@ -631,6 +802,54 @@ impl PinyinDatabase {
             .ok_or_else(|| EngineError::failed(DICTIONARY_CLOSED))
     }
 
+    fn exact_table_rows(&self, table: &str, key: &str, limit: usize) -> Vec<DictRow> {
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(table) {
+                let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                let base = self.rows(
+                    &exact_sql(table, sql_limit(fetch_limit)),
+                    [key],
+                    query_capacity(limit),
+                );
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| row.key == key);
+            }
+        }
+        self.rows(
+            &exact_sql(table, sql_limit(limit)),
+            [key],
+            query_capacity(limit),
+        )
+    }
+
+    fn range_table_rows(
+        &self,
+        table: &str,
+        prefix: &str,
+        upper_bound: &str,
+        limit: usize,
+    ) -> Vec<DictRow> {
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(table) {
+                let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                let base = self.rows(
+                    &range_sql(table, sql_limit(fetch_limit)),
+                    [prefix, upper_bound],
+                    query_capacity(limit),
+                );
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                    row.key.as_str() >= prefix && row.key.as_str() < upper_bound
+                });
+            }
+        }
+        self.rows(
+            &range_sql(table, sql_limit(limit)),
+            [prefix, upper_bound],
+            query_capacity(limit),
+        )
+    }
+
     /// QQ:840-898, the statement-cached cascade.
     fn query_single_cut_keyed(
         &self,
@@ -646,11 +865,7 @@ impl PinyinDatabase {
         let bound = sql_limit(limit);
 
         if can_match_exact_key(segments) {
-            let rows = self.rows(
-                &exact_sql(&table, bound),
-                [key.as_str()],
-                query_capacity(limit),
-            );
+            let rows = self.exact_table_rows(&table, key.as_str(), limit);
             if !rows.is_empty() {
                 return rows;
             }
@@ -660,40 +875,96 @@ impl PinyinDatabase {
         let pattern = build_key_like_pattern(segments);
         let prefix = &pattern[..pattern.len() - 1];
         let upper_bound = key_prefix_upper_bound(prefix);
-        let rows = self.rows(
-            &range_sql(&table, bound),
-            [prefix, upper_bound.as_str()],
-            query_capacity(limit),
-        );
+        let rows = self.range_table_rows(&table, prefix, upper_bound.as_str(), limit);
         if !rows.is_empty() {
             return rows;
         }
 
         if needs_mixed_jianpin_query(segments, source) {
             let scan_limit_value = build_mixed_jianpin_scan_limit(limit);
-            let scan_limit = sql_limit(scan_limit_value);
-            // 过滤扫描行时直接写入结果；首次命中才按原提示预留，避免整页临时缓冲。
-            let mut rows = Vec::new();
-            self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
-                if rows.len() >= limit {
-                    return false;
+            if self.overlay.has_pinyin() {
+                let guard = self.overlay.read();
+                if let Some(table_overlay) = guard.pinyin.get(&table) {
+                    let fetch_limit = scan_limit_value.saturating_add(table_overlay.deleted.len());
+                    let scan_limit = sql_limit(fetch_limit);
+                    let mut base = Vec::new();
+                    self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+                        if table_overlay.is_deleted(&row.key, &row.value)
+                            || table_overlay.has_upsert(&row.key, &row.value)
+                            || !matches_mixed_segments(&row.key, segments, source)
+                        {
+                            return true;
+                        }
+                        if base.capacity() == 0 {
+                            base.reserve_exact(limit.min(128));
+                        }
+                        base.push(row);
+                        base.len() < limit
+                    });
+                    let merged = merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                        row.jp == jp && matches_mixed_segments(&row.key, segments, source)
+                    });
+                    if !merged.is_empty() {
+                        return merged;
+                    }
+                } else {
+                    drop(guard);
+                    let scan_limit = sql_limit(scan_limit_value);
+                    let mut rows = Vec::new();
+                    self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+                        if rows.len() >= limit {
+                            return false;
+                        }
+                        if !matches_mixed_segments(&row.key, segments, source) {
+                            return true;
+                        }
+                        if rows.capacity() == 0 {
+                            rows.reserve_exact(limit.min(128));
+                        }
+                        rows.push(row);
+                        rows.len() < limit
+                    });
+                    if !rows.is_empty() {
+                        return rows;
+                    }
                 }
-                if !matches_mixed_segments(&row.key, segments, source) {
-                    return true;
+            } else {
+                let scan_limit = sql_limit(scan_limit_value);
+                // 过滤扫描行时直接写入结果；首次命中才按原提示预留，避免整页临时缓冲。
+                let mut rows = Vec::new();
+                self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+                    if rows.len() >= limit {
+                        return false;
+                    }
+                    if !matches_mixed_segments(&row.key, segments, source) {
+                        return true;
+                    }
+                    if rows.capacity() == 0 {
+                        rows.reserve_exact(limit.min(128));
+                    }
+                    rows.push(row);
+                    rows.len() < limit
+                });
+                if !rows.is_empty() {
+                    return rows;
                 }
-                if rows.capacity() == 0 {
-                    rows.reserve_exact(limit.min(128));
-                }
-                rows.push(row);
-                rows.len() < limit
-            });
-            if !rows.is_empty() {
-                return rows;
             }
         }
 
         if !is_pure_jianpin(segments) {
             return Vec::new();
+        }
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(&table) {
+                let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                let base = self.rows(
+                    &jianpin_sql(&table, sql_limit(fetch_limit)),
+                    [jp.as_str()],
+                    query_capacity(limit),
+                );
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| row.jp == jp);
+            }
         }
         self.rows(
             &jianpin_sql(&table, bound),
@@ -709,11 +980,7 @@ impl PinyinDatabase {
         };
         if can_match_exact_key(segments) {
             let key = join_segments(segments);
-            let rows = self.rows(
-                &exact_sql(&table, sql_limit(limit)),
-                [key.as_str()],
-                query_capacity(limit),
-            );
+            let rows = self.exact_table_rows(&table, key.as_str(), limit);
             if !rows.is_empty() {
                 return rows;
             }
@@ -724,7 +991,35 @@ impl PinyinDatabase {
         }
         let tail = segments.last().map(String::as_str);
         let jp = segments_to_jianpin(segments);
-        let scan_limit = sql_limit(build_mixed_jianpin_scan_limit(limit));
+        let scan_limit_value = build_mixed_jianpin_scan_limit(limit);
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(&table) {
+                let fetch_limit = scan_limit_value.saturating_add(table_overlay.deleted.len());
+                let scan_limit = sql_limit(fetch_limit);
+                let mut base = Vec::new();
+                self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+                    if table_overlay.is_deleted(&row.key, &row.value)
+                        || table_overlay.has_upsert(&row.key, &row.value)
+                        || row.key.rsplit('\'').next() != tail
+                        || !matches_mixed_segments(&row.key, segments, source)
+                    {
+                        return true;
+                    }
+                    if base.capacity() == 0 {
+                        base.reserve_exact(limit.min(128));
+                    }
+                    base.push(row);
+                    base.len() < limit
+                });
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                    row.jp == jp
+                        && row.key.rsplit('\'').next() == tail
+                        && matches_mixed_segments(&row.key, segments, source)
+                });
+            }
+        }
+        let scan_limit = sql_limit(scan_limit_value);
         let mut rows = Vec::new();
         self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
             if rows.len() >= limit {
@@ -748,6 +1043,21 @@ impl PinyinDatabase {
     fn batch_rows<K: AsRef<str>>(&self, table: &str, keys: &[K], limit: usize) -> Vec<DictRow> {
         if table.is_empty() || keys.is_empty() || limit == 0 {
             return Vec::new();
+        }
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(table) {
+                let fetch_limit = limit.saturating_add(table_overlay.deleted.len());
+                let sql = batch_sql(table, keys.len(), sql_limit(fetch_limit));
+                let base = self.rows(
+                    &sql,
+                    params_from_iter(keys.iter().map(AsRef::as_ref)),
+                    query_capacity(limit),
+                );
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                    keys.iter().any(|k| k.as_ref() == row.key)
+                });
+            }
         }
         let sql = batch_sql(table, keys.len(), sql_limit(limit));
         self.rows(
@@ -809,6 +1119,59 @@ impl PinyinDatabase {
             }
         }
     }
+}
+
+fn open_read_only_connection(path: &Path) -> Option<Connection> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let path = crate::paths::sqlite_read_only_path_no_follow(path).ok()?;
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    connection.busy_timeout(Duration::ZERO).ok()?;
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    let _ = connection.pragma_update(None, "mmap_size", DICTIONARY_MMAP_SIZE);
+    Some(connection)
+}
+
+pub(crate) fn merge_pinyin_overlay_rows(
+    mut base: Vec<DictRow>,
+    table_overlay: &PinyinTableOverlay,
+    limit: usize,
+    matches: impl Fn(&PinyinOverlayRow) -> bool,
+) -> Vec<DictRow> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if !table_overlay.deleted.is_empty() || !table_overlay.upserts.is_empty() {
+        base.retain(|row| {
+            !table_overlay.is_deleted(&row.key, &row.value)
+                && !table_overlay.has_upsert(&row.key, &row.value)
+        });
+    }
+    let mut merged: Vec<DictRow> = table_overlay
+        .upserts
+        .iter()
+        .filter(|row| matches(row))
+        .map(|row| DictRow {
+            key: row.key.clone(),
+            value: row.value.clone(),
+            weight: row.weight,
+        })
+        .collect();
+    if merged.is_empty() {
+        base.truncate(limit);
+        return base;
+    }
+    merged.extend(base);
+    merged.sort_by_key(|row| std::cmp::Reverse(row.weight));
+    merged.truncate(limit);
+    merged
 }
 
 fn open_connection(path: &Path) -> Option<Connection> {

@@ -15,6 +15,7 @@ use super::options::{CommittedSpanList, SessionOptions};
 use crate::assets;
 use crate::cantonese;
 use crate::diagnostics;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::error::{EngineError, Result};
 use crate::helpcode::{
     is_supported_helpcode_schema, load_helpcode_keymap_with_fallback, SharedKeymap,
@@ -61,6 +62,8 @@ pub(super) struct CreatingWordProgress {
 pub(super) struct InputSession {
     pub paths: RuntimePaths,
     pub journal_path: PathBuf,
+    pub read_only_dictionaries: bool,
+    pub overlay: SharedUserOverlay,
     pub engine: ImeSession,
     pub queries: CandidateQueries,
     pub quick_phrase_candidates: bool,
@@ -164,7 +167,16 @@ pub(super) struct InputSession {
 
 impl InputSession {
     /// Everything `Session::new` applies, in the reference order.
+    #[allow(dead_code)]
     pub fn new(options: &SessionOptions) -> Result<Self> {
+        Self::new_with_options(options, false, SharedUserOverlay::default())
+    }
+
+    pub fn new_with_options(
+        options: &SessionOptions,
+        read_only_dictionaries: bool,
+        overlay: SharedUserOverlay,
+    ) -> Result<Self> {
         if options
             .helpcode_trigger_key
             .is_some_and(|key| !b";/\\`=".contains(&key))
@@ -172,13 +184,17 @@ impl InputSession {
             return Err(EngineError::invalid(diagnostics::INVALID_SESSION_OPTIONS));
         }
         let paths = options.paths.clone();
-        let journal = paths.user(assets::USER_JOURNAL);
+        let journal = if read_only_dictionaries {
+            PathBuf::new()
+        } else {
+            paths.user(assets::USER_JOURNAL)
+        };
         let profile = session_profile(
             options.shuangpin_profile,
             options.shuangpin_custom_profile.as_ref(),
             options.enabled_schemes.contains(SchemeType::Shuangpin),
         )?;
-        let mut engine = ImeSession::new(
+        let mut engine = ImeSession::new_with_options(
             options.scheme,
             options.enabled_schemes,
             profile,
@@ -187,6 +203,8 @@ impl InputSession {
             options.zhuyin_dictionary.clone(),
             options.stroke_dictionary.clone(),
             options.japanese_dictionary.clone(),
+            read_only_dictionaries,
+            overlay.clone(),
         )?;
         engine.set_force_cantonese_shuangpin(options.force_cantonese_shuangpin);
         engine.set_cantonese_output_conversion(options.cantonese_output_conversion);
@@ -200,7 +218,12 @@ impl InputSession {
             options.vietnamese_tone_style,
         );
         let mut session = Self {
-            queries: CandidateQueries::new(&paths, profile),
+            queries: CandidateQueries::new_with_options(
+                &paths,
+                profile,
+                read_only_dictionaries,
+                overlay.clone(),
+            ),
             quick_phrase_candidates: options.quick_phrase_candidates,
             quick_phrase_frequency: options.quick_phrase_frequency,
             quick_phrase_first: options.quick_phrase_first,
@@ -239,10 +262,12 @@ impl InputSession {
                 } else {
                     options.japanese_dictionary.clone()
                 };
-                crate::multilingual::DictionaryComposer::with_japanese_model(
+                crate::multilingual::DictionaryComposer::with_options(
                     &paths,
                     &options.multilingual_languages,
                     &model,
+                    read_only_dictionaries,
+                    overlay.clone(),
                 )
             }),
             multilingual_conversion: None,
@@ -285,6 +310,8 @@ impl InputSession {
             pending_touch: None,
             committed_spans: CommittedSpanList::default(),
             journal_path: journal,
+            read_only_dictionaries,
+            overlay,
             paths,
         };
 
@@ -1853,6 +1880,75 @@ impl InputSession {
         self.prefix_query_input.clear();
         // 光标后编辑固定的那段同样要按新的词库重新转换。
         self.caret_edit.prefix_input.clear();
+    }
+
+    pub(super) fn on_user_overlay_changed(&mut self) {
+        self.engine.reset_pinyin_caches();
+        self.queries.clear_english_cache();
+        if let Some(composer) = &mut self.multilingual {
+            composer.clear();
+        }
+        if let Some(engine) = self.canonical_phrase_engine.as_mut() {
+            engine.reset_cache();
+        }
+        self.prefix_query_input.clear();
+        self.caret_edit.prefix_input.clear();
+        if self.dedicated_english {
+            self.update_dedicated_english_candidates();
+        } else if self.local_mode != LocalInputMode::None {
+            let _ = self.update_local_candidates();
+        } else if self.has_composition() {
+            self.recompute_candidates();
+            self.invalidate_online_requests();
+        } else {
+            self.update_mixed_candidates();
+        }
+    }
+
+    pub(super) fn can_defer_quanpin_letter(&self, value: u8, shift_only: bool) -> bool {
+        !shift_only
+            && value.is_ascii_lowercase()
+            && self.scheme() == SchemeType::Quanpin
+            && self.local_mode == LocalInputMode::None
+            && !self.dedicated_english
+            && self.conversion.is_none()
+            && self.helpcode_entry.is_none()
+            && !self.takes_literal_symbol(value)
+            && self
+                .caret
+                .is_none_or(|caret| caret >= self.editing_text_len())
+            && self.url_entry(value).is_none()
+            && self.pending_sequence.is_none()
+            && self.pending_sequence_with_cases.is_none()
+    }
+
+    pub(super) fn defer_quanpin_letter(&mut self, value: u8) {
+        self.punctuation.clear_quote_undo();
+        self.exit_date_time_menu();
+        self.uppercase_passthrough = false;
+        self.caret = None;
+        if !self.has_composition()
+            && self.chain.previous.is_some()
+            && self.chain.paused(self.steady_now())
+        {
+            self.chain.reset();
+        }
+        let touch = self.pending_touch.take();
+        self.engine.set_pending_touch(touch);
+        let handled = self.engine.handle_quanpin_letter_deferred(value);
+        debug_assert!(handled);
+        self.glide_candidates = None;
+        self.multilingual_conversion = None;
+        self.prefix_active = false;
+        self.personal_reranked = false;
+        self.ranking_candidates = None;
+        self.mixed_candidates.clear();
+        self.invalidate_online_requests();
+    }
+
+    pub(super) fn flush_deferred_candidates(&mut self) {
+        self.engine.flush_deferred_candidates();
+        self.update_mixed_candidates();
     }
 
     pub fn clear_online_candidates(&mut self, source: CandidateSource) {

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::dictionary::pinyin::PinyinDatabase;
 use crate::lattice::offensive::OffensiveWords;
 use crate::ordering::{apply_order, prediction_order, CandidateScorer};
@@ -28,13 +29,15 @@ pub(super) struct Prediction {
     /// 这次上屏的文字，等 [`Self::order`] 拿它接在上文后面打分；排过一次、或者没有可排的就是 `None`，所以每次上屏只打一次分。
     pending: Option<String>,
     path: PathBuf,
+    read_only: bool,
+    overlay: SharedUserOverlay,
     database: Option<PinyinDatabase>,
     /// 联想不给的粗俗词：词库打开时从它的 `sentence_excluded` 表读，没有就是内嵌表，见 `lattice::offensive`。
     offensive: OffensiveWords,
 }
 
 impl Prediction {
-    pub fn new(enabled: bool, path: PathBuf) -> Self {
+    pub fn new(enabled: bool, path: PathBuf, read_only: bool, overlay: SharedUserOverlay) -> Self {
         Self {
             enabled,
             allowed: true,
@@ -45,6 +48,8 @@ impl Prediction {
             spare: Vec::new(),
             pending: None,
             path,
+            read_only,
+            overlay,
             database: None,
             offensive: OffensiveWords::default(),
         }
@@ -95,7 +100,8 @@ impl Prediction {
         }
         // 词库在第一次联想时才打开，个人习惯行也要按词库的粗俗词表过滤，所以先打开它。
         if self.database.is_none() {
-            let database = PinyinDatabase::open(&self.path);
+            let database =
+                PinyinDatabase::open_with_options(&self.path, self.read_only, self.overlay.clone());
             self.offensive = database.offensive_words();
             self.database = Some(database);
         }

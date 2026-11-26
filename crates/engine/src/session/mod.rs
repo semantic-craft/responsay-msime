@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::diagnostics;
+use crate::dictionary::overlay::{SharedUserOverlay, UserOverlayData};
 use crate::error::{EngineError, Result};
 use crate::local::database::LocalDatabaseLease;
 use crate::nine_key::{KeyGrid, NineKeySession};
@@ -65,6 +66,8 @@ pub struct Session {
     /// `SessionOptions::grid_helpcode`。
     grid_helpcode: bool,
     prediction: prediction::Prediction,
+    overlay: SharedUserOverlay,
+    candidates_dirty: bool,
     /// See [`Self::candidate_revision`].
     revision: u64,
     /// `msime_user.db` of this session's paths, written once more as the session ends.
@@ -85,8 +88,22 @@ impl Session {
     pub fn new(options: SessionOptions) -> Result<Session> {
         options.paths.validate()?;
         crate::user_dictionary::generation::check_read_only_layout(&options.paths)?;
-        let input = Box::new(InputSession::new(&options)?);
-        let mut nine_key = NineKeySession::new(
+        let read_only_dictionaries =
+            !options.learning && options.paths.dictionaries == options.paths.resources;
+        let overlay = SharedUserOverlay::default();
+        if read_only_dictionaries {
+            if let Some(data) = UserOverlayData::load_one_shot_journal(
+                &options.paths.user(crate::assets::USER_JOURNAL),
+            ) {
+                overlay.replace(data);
+            }
+        }
+        let input = Box::new(InputSession::new_with_options(
+            &options,
+            read_only_dictionaries,
+            overlay.clone(),
+        )?);
+        let mut nine_key = NineKeySession::new_with_options(
             &options.paths,
             options.learning,
             options.frequency,
@@ -94,6 +111,8 @@ impl Session {
             options.english,
             options.enabled_schemes.contains(SchemeType::Quanpin),
             options.single_character_only,
+            read_only_dictionaries,
+            overlay.clone(),
         );
         nine_key.set_stroke_dictionary(options.stroke_dictionary.clone());
         nine_key.set_precise_nine_key(options.precise_nine_key);
@@ -115,7 +134,11 @@ impl Session {
         // 九键选中的词记进同一个个人上下文模型，开关与 26 键相同（#6185）。
         nine_key.set_personal_context_enabled(options.personal_context);
         nine_key.set_mark_learned_words_user_inserted(options.mark_learned_words_user_inserted);
-        let journal = options.paths.user(crate::assets::USER_JOURNAL);
+        let journal = if read_only_dictionaries {
+            PathBuf::new()
+        } else {
+            options.paths.user(crate::assets::USER_JOURNAL)
+        };
         Ok(Session {
             input,
             nine_key,
@@ -127,7 +150,11 @@ impl Session {
             prediction: prediction::Prediction::new(
                 options.next_word_prediction,
                 options.paths.dictionary(crate::assets::MAIN_DICTIONARY),
+                read_only_dictionaries,
+                overlay.clone(),
             ),
+            overlay,
+            candidates_dirty: false,
             revision: 0,
             journal_use: JournalUse::new(journal.clone()),
             journal,
@@ -138,12 +165,60 @@ impl Session {
         })
     }
 
+    pub fn set_user_overlay_json(&mut self, json: &str) -> Result<()> {
+        self.flush_deferred_candidates();
+        let data = UserOverlayData::from_json(json)?;
+        self.overlay.replace(data);
+        self.candidates_may_change();
+        self.prediction.clear();
+        self.input.on_user_overlay_changed();
+        self.nine_key.on_user_overlay_changed();
+        Ok(())
+    }
+
+    pub fn has_deferred_candidates(&self) -> bool {
+        self.candidates_dirty
+    }
+
+    pub fn flush_deferred_candidates(&mut self) {
+        if !self.candidates_dirty {
+            return;
+        }
+        self.candidates_dirty = false;
+        self.input.flush_deferred_candidates();
+    }
+
+    pub fn deferred_display_snapshot(&self) -> SessionSnapshot {
+        let editing_text = self.input.editing_text();
+        let caret_position = self.input.caret_position();
+        let preedit = crate::pinyin::segment::cut_pinyin_by_mode(
+            &editing_text,
+            crate::pinyin::segment::CutMode::Greedy,
+        )
+        .first()
+        .map(|segments| crate::pinyin::segment::join_segments(segments))
+        .filter(|segmented| !segmented.is_empty())
+        .unwrap_or_else(|| editing_text.clone());
+        SessionSnapshot {
+            prediction: false,
+            scheme: self.input.scheme(),
+            local_mode: self.input.local_mode,
+            spelling_symbols: self.input.spelling_symbols(),
+            preedit,
+            editing_text,
+            caret_position,
+            shuangpin_profile: self.input.profile.kind.name().to_owned(),
+            ..SessionSnapshot::default()
+        }
+    }
+
     /// Changes whenever a call may have changed the candidate list, so a host that read the candidates under one revision can tell that an index it holds no longer means the same row. Read-only calls never change it; neither do the setters that only affect later keys (clock, key touch and geometry, touch tuning, punctuation options, rescoring context). Starts at 0 and only grows.
     pub fn candidate_revision(&self) -> u64 {
         self.revision
     }
 
     fn candidates_may_change(&mut self) {
+        self.flush_deferred_candidates();
         self.revision = self.revision.wrapping_add(1);
         self.input.committed_spans.clear();
     }
@@ -174,6 +249,7 @@ impl Session {
 
     /// One ASCII character; `shift_only` is a bare Shift+letter (local mode entry). 全拼下九键开启且没有别的组字时，数字 2-9 交给九宫格会话；九键双拼交的是方案用到的数字（可以有 1 和 0）；注音九键的数字由注音编辑器自己处理。待用的触点（[`Self::set_key_touch`]）只交给 26 键组字，九宫格的数字用不到它，一律在这一键后作废。
     pub fn character(&mut self, value: u8, shift_only: bool) -> KeyResult {
+        self.flush_deferred_candidates();
         self.candidates_may_change();
         self.prediction.clear();
         let touch = self.input.pending_touch.take();
@@ -211,6 +287,37 @@ impl Session {
         }
         self.input.pending_touch = touch;
         self.input.handle_character(value, shift_only)
+    }
+
+    pub fn character_with_defer(
+        &mut self,
+        value: u8,
+        shift_only: bool,
+        defer_candidates: bool,
+    ) -> KeyResult {
+        if !defer_candidates {
+            return self.character(value, shift_only);
+        }
+        let grid_digit = match self.key_grid {
+            Some(KeyGrid::NineKey) => (b'2'..=b'9').contains(&value),
+            Some(grid @ KeyGrid::NineKeyShuangpin(_)) => {
+                !self.input.dedicated_english && grid.is_code(value)
+            }
+            _ => false,
+        };
+        if !grid_digit
+            && !self.nine_key.active()
+            && !self.requires_candidate_selection()
+            && self.input.can_defer_quanpin_letter(value, shift_only)
+        {
+            self.revision = self.revision.wrapping_add(1);
+            self.input.committed_spans.clear();
+            self.prediction.clear();
+            self.input.defer_quanpin_letter(value);
+            self.candidates_dirty = true;
+            return KeyResult::handled();
+        }
+        self.character(value, shift_only)
     }
 
     /// 下一次 `character` 的按下点（触屏宿主经 `msime_client_touch_character` 送来）。只有那一键是 26 键双拼的小写字母或 `;` 时才交给方案；其余会改动组字或改道按键的入口（命令、选词、以词定字、结束组字、钉住和删除候选、移光标、九宫格、网格键、滑行、标点、换方案、换网格或几何、展开首字母候选、重置上下文）一开头就丢掉它，所以改道到别处的按键不会把触点留给后面的字母。只改配置的 setter（辅助码表、云候选开关、重排上下文等）不碰它。
@@ -375,6 +482,7 @@ impl Session {
 
     /// 一条编辑命令。`CommitRaw` 原样上屏，专用英文里打的词学进英文词库（`SessionOptions::learn_english_on_enter`），`learn_typed_spellings_on_enter` 打开时还学临时模式与拼不成音节的拼音；`CommitRawWithoutLearning` 原样上屏、不学英文词。规则见 `session/raw_commit.rs`。
     pub fn command(&mut self, command: Command) -> KeyResult {
+        self.flush_deferred_candidates();
         self.input.committed_spans.clear();
         if self.requires_candidate_selection()
             && matches!(
@@ -454,6 +562,7 @@ impl Session {
 
     /// Finishes the composition and appends the Chinese mark; unhandled when Chinese punctuation is off or locked to ASCII, or the key has no mark.
     pub fn punctuation(&mut self, value: u8) -> KeyResult {
+        self.flush_deferred_candidates();
         self.input.committed_spans.clear();
         if self.requires_candidate_selection() {
             self.input.pending_touch = None;
@@ -887,6 +996,7 @@ impl Session {
 
     /// Hand over the candidates withheld from a single-letter query; whether the list grew.
     pub fn expand_initial_candidates(&mut self) -> bool {
+        self.flush_deferred_candidates();
         self.input.committed_spans.clear();
         self.input.pending_touch = None;
         // Nine-key rows come from the spelling session rather than a dictionary query, so nothing is withheld there.
@@ -1192,6 +1302,7 @@ impl Session {
         words: &[String],
         source: CandidateSource,
     ) -> bool {
+        self.flush_deferred_candidates();
         if self.nine_key.active() {
             return false;
         }
@@ -1214,6 +1325,7 @@ impl Session {
         word: &str,
         source: CandidateSource,
     ) -> bool {
+        self.flush_deferred_candidates();
         if self.nine_key.active() {
             return false;
         }

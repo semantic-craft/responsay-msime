@@ -20,6 +20,7 @@ use super::ShuangpinProfile;
 use crate::assets;
 use crate::cache::FifoCache;
 use crate::dictionary::english::EnglishDictionary;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::dictionary::pinyin::PinyinDatabase;
 use crate::dictionary::DictRow;
 use crate::helpcode::{
@@ -147,6 +148,7 @@ pub struct ShuangpinDictionary {
     typo_generation: u64,
     /// 当前请求允许纠错整句坐首选（`ShuangpinEngine` 按请求判断：整串带触点、没有辅助码、内置方案），而且 `lead_margin` 不是无穷大。为真时触点签名多一个标记，这样的答案和不允许时的答案各存各的缓存，不允许的请求（例如末尾单辅助码）读到的整句答案与没有首选规则时逐字节相同。
     lead_allowed: bool,
+    overlay: SharedUserOverlay,
 }
 
 impl ShuangpinDictionary {
@@ -155,9 +157,23 @@ impl ShuangpinDictionary {
         self.sentence_tables.offensive_words()
     }
 
+    #[cfg(test)]
     pub fn new(profile: &'static ShuangpinProfile, paths: &RuntimePaths) -> Self {
+        Self::new_with_options(profile, paths, false, SharedUserOverlay::default())
+    }
+
+    pub fn new_with_options(
+        profile: &'static ShuangpinProfile,
+        paths: &RuntimePaths,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         // READWRITE without CREATE: a missing dictionary stays missing and every query answers empty (SD:54-70).
-        let mut database = PinyinDatabase::open(&paths.dictionary(assets::MAIN_DICTIONARY));
+        let mut database = PinyinDatabase::open_with_options(
+            &paths.dictionary(assets::MAIN_DICTIONARY),
+            read_only,
+            overlay.clone(),
+        );
         let mut sentence_tables = SentenceNgramTables::default();
         if database.is_open() {
             database.warm_up();
@@ -167,11 +183,18 @@ impl ShuangpinDictionary {
             // Records the data version so the first cache hit has something to compare with.
             database.database_changed();
         }
-        let personal = PersonalNgramStore::for_journal(&paths.user(assets::USER_JOURNAL));
-        let typo_profile = PersonalTypoProfile::shared(&paths.user(assets::USER_JOURNAL));
+        let journal = if read_only {
+            std::path::PathBuf::new()
+        } else {
+            paths.user(assets::USER_JOURNAL)
+        };
+        let personal = PersonalNgramStore::for_journal(&journal);
+        let typo_profile = PersonalTypoProfile::shared(&journal);
         let typo_generation = typo_profile.generation();
         // The model loads lazily and bumps its version when it does. Left to the first lattice merge, that load would land on a keystroke and mark the answer it just scored as stale, so the next query for the same key would drop it together with any online rows put into it.
-        drop(personal.model());
+        if !read_only {
+            drop(personal.model());
+        }
         let personal_version = personal.version();
         Self {
             profile,
@@ -205,6 +228,7 @@ impl ShuangpinDictionary {
             typo_profile,
             typo_generation,
             lead_allowed: false,
+            overlay,
         }
     }
 
@@ -1082,11 +1106,13 @@ impl ShuangpinDictionary {
             return;
         }
         let paths = &self.paths;
+        let overlay = &self.overlay;
         let english_dict = self.english_dictionary.get_or_insert_with(|| {
-            EnglishDictionary::open(
+            EnglishDictionary::open_with_overlay(
                 &paths.dictionary(assets::ENGLISH_DICTIONARY),
                 Some(&paths.resource(assets::TRANSLATIONS)),
                 Some(&paths.user(assets::LEARNED_GLOSSES)),
+                overlay.clone(),
             )
         });
         let options = self.sentence_tables.options(self.sentence_alternatives);
@@ -1140,6 +1166,9 @@ impl ShuangpinDictionary {
         self.double_helpcode_cache.clear();
         self.personal_scored_keys.clear();
         self.typo_span_cache.clear();
+        if let Some(english) = &self.english_dictionary {
+            english.clear_cache();
+        }
     }
 }
 

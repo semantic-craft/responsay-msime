@@ -92,6 +92,8 @@ fn fixture(per_length: usize) -> PinyinDatabase {
     PinyinDatabase {
         connection: Some(connection),
         data_version: None,
+        overlay: crate::dictionary::overlay::SharedUserOverlay::default(),
+        overlay_generation: 0,
     }
 }
 

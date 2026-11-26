@@ -15,7 +15,7 @@ impl PinyinDatabase {
         {
             return self.query_lattice_span_with_trailing_initial(span, limit);
         }
-        if self.connection.is_none()
+        if !self.is_open()
             || span.is_empty()
             || limit == 0
             || !span.iter().all(|part| {
@@ -28,11 +28,9 @@ impl PinyinDatabase {
             return Vec::new();
         };
         let jp = segments_to_jianpin(span);
-        let scan_limit = sql_limit(build_mixed_jianpin_scan_limit(limit));
-        let mut result = Vec::new();
-        self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
-            let mut actual = row.key.split('\'');
-            let matches = span.iter().all(|expected| {
+        let span_matches = |key: &str| {
+            let mut actual = key.split('\'');
+            span.iter().all(|expected| {
                 let Some(syllable) = actual.next() else {
                     return false;
                 };
@@ -42,8 +40,33 @@ impl PinyinDatabase {
                     } else {
                         extract_initial_token(syllable) == expected
                     }
-            }) && actual.next().is_none();
-            if matches {
+            }) && actual.next().is_none()
+        };
+        let scan_limit_value = build_mixed_jianpin_scan_limit(limit);
+        if self.overlay.has_pinyin() {
+            let guard = self.overlay.read();
+            if let Some(table_overlay) = guard.pinyin.get(&table) {
+                let scan_limit =
+                    sql_limit(scan_limit_value.saturating_add(table_overlay.deleted.len()));
+                let mut base = Vec::new();
+                self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+                    if !table_overlay.is_deleted(&row.key, &row.value)
+                        && !table_overlay.has_upsert(&row.key, &row.value)
+                        && span_matches(&row.key)
+                    {
+                        base.push(row);
+                    }
+                    base.len() < limit
+                });
+                return merge_pinyin_overlay_rows(base, table_overlay, limit, |row| {
+                    row.jp == jp && span_matches(&row.key)
+                });
+            }
+        }
+        let scan_limit = sql_limit(scan_limit_value);
+        let mut result = Vec::new();
+        self.visit_rows_until(&jianpin_sql(&table, scan_limit), [jp.as_str()], |row| {
+            if span_matches(&row.key) {
                 result.push(row);
             }
             result.len() < limit

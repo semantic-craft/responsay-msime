@@ -4,6 +4,7 @@ use std::path::Path;
 use super::{decode, Conversion, Language, Lexeme, MAX_INPUT_BYTES, MAX_LEXEMES};
 use crate::assets;
 use crate::dictionary::english::EnglishDictionary;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::japanese::{JapaneseProvider, JapaneseRomajiScheme};
 use crate::pinyin::segment::cut_one_piece_min_segments;
 use crate::quanpin::QuanpinEngine;
@@ -41,6 +42,16 @@ impl DictionaryComposer {
 
     /// 使用宿主已解析的日文资源包路径，其它词库仍取同一份运行时目录。
     pub fn with_japanese_model(paths: &RuntimePaths, languages: &[Language], model: &Path) -> Self {
+        Self::with_options(paths, languages, model, false, SharedUserOverlay::default())
+    }
+
+    pub fn with_options(
+        paths: &RuntimePaths,
+        languages: &[Language],
+        model: &Path,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         let languages: Vec<_> = [Language::Chinese, Language::English, Language::Japanese]
             .into_iter()
             .filter(|language| languages.contains(language))
@@ -48,9 +59,14 @@ impl DictionaryComposer {
         let active = languages.len() >= 2;
         Self {
             chinese: (active && languages.contains(&Language::Chinese))
-                .then(|| QuanpinEngine::new(paths)),
+                .then(|| QuanpinEngine::new_with_options(paths, read_only, overlay.clone())),
             english: (active && languages.contains(&Language::English)).then(|| {
-                EnglishDictionary::open(&paths.dictionary(assets::ENGLISH_DICTIONARY), None, None)
+                EnglishDictionary::open_with_overlay(
+                    &paths.dictionary(assets::ENGLISH_DICTIONARY),
+                    None,
+                    None,
+                    overlay,
+                )
             }),
             japanese: (active && languages.contains(&Language::Japanese))
                 .then(|| JapaneseProvider::new(model)),

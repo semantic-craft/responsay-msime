@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use super::database::{lock, open_local_database};
 use super::LocalQueryResult;
 use crate::diagnostics;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::types::{CandidateSource, QuickPhraseEntry, WordItem};
 
 mod expansion;
@@ -25,8 +26,68 @@ const EXACT_SQL: &str =
     "SELECT key,value,weight FROM quick_parases WHERE key=?1 ORDER BY weight DESC,value LIMIT ?2";
 
 /// `SELECT key,value,weight FROM quick_parases WHERE key>=?1 AND key<?2 ORDER BY weight DESC,key,value LIMIT ?3`, upper bound `prefix + "\x7f"`; QuickPhrase rows.
+#[cfg(test)]
 pub fn query_quick_phrases(prefix: &str, main_db: &Path) -> LocalQueryResult {
     query_quick_phrases_with_limit(prefix, main_db, RESULT_LIMIT)
+}
+
+pub fn query_quick_phrases_with_overlay(
+    prefix: &str,
+    main_db: &Path,
+    limit: usize,
+    overlay: &SharedUserOverlay,
+) -> LocalQueryResult {
+    if !overlay.has_quick() {
+        return query_quick_phrases_with_limit(prefix, main_db, limit);
+    }
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_lowercase()) || limit == 0 {
+        return LocalQueryResult::default();
+    }
+    let upper_bound = prefix_upper_bound(prefix);
+    let guard = overlay.read();
+    let quick = &guard.quick;
+    let fetch_limit = limit.saturating_add(quick.deleted.len());
+    let mut base = match open_local_database(main_db) {
+        Some(database) => match read(
+            &lock(&database),
+            SQL,
+            rusqlite::params![prefix, upper_bound, super::sql_limit(fetch_limit)],
+            fetch_limit,
+        ) {
+            Ok(candidates) => LocalQueryResult {
+                candidates,
+                diagnostic: None,
+            },
+            Err(_) => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_QUERY_FAILED),
+        },
+        None => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_UNAVAILABLE),
+    };
+    base.candidates.retain(|item| {
+        !quick.is_deleted(&item.pinyin, &item.word) && !quick.has_upsert(&item.pinyin, &item.word)
+    });
+    for row in &quick.upserts {
+        if row.key.as_str() >= prefix && row.key.as_str() < upper_bound.as_str() {
+            base.candidates.push(WordItem::new(
+                row.key.clone(),
+                row.value.clone(),
+                row.weight,
+                CandidateSource::QuickPhrase,
+                "",
+            ));
+        }
+    }
+    base.candidates.sort_by(|left, right| {
+        right
+            .weight
+            .cmp(&left.weight)
+            .then_with(|| left.pinyin.cmp(&right.pinyin))
+            .then_with(|| left.word.cmp(&right.word))
+    });
+    base.candidates.truncate(limit);
+    if !base.candidates.is_empty() {
+        base.diagnostic = None;
+    }
+    base
 }
 
 /// `query_quick_phrases` with the reference's explicit limit; zero answers nothing.
@@ -59,33 +120,82 @@ pub fn query_quick_phrases_with_limit(
 }
 
 /// 普通组字追加的快捷短语：只取编码恰好是 `code` 的行，先是数据库行（按权重），再接上编码相同的宿主短语行，文本重复的跳过，总数不超过 `RESULT_LIMIT`。K 模式按前缀列出整张表，普通组字若也按前缀匹配，`x`、`p` 这类单个字母就会把以它开头的短语全部带进普通候选。`table` 必须先经过 [`usable_quick_phrase_table`]。
-pub fn query_exact_quick_phrases(
+pub fn query_exact_quick_phrases_with_overlay(
     code: &str,
     main_db: &Path,
     table: &[QuickPhraseEntry],
+    overlay: &SharedUserOverlay,
 ) -> LocalQueryResult {
     if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_lowercase()) {
         return LocalQueryResult::default();
     }
-    let database = match open_local_database(main_db) {
-        None => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_UNAVAILABLE),
-        Some(database) => match read(
-            &lock(&database),
-            EXACT_SQL,
-            rusqlite::params![code, super::sql_limit(RESULT_LIMIT)],
-            RESULT_LIMIT,
-        ) {
-            Ok(candidates) => LocalQueryResult {
-                candidates,
-                diagnostic: None,
+    let mut database = if overlay.has_quick() {
+        let guard = overlay.read();
+        let quick = &guard.quick;
+        let fetch_limit = RESULT_LIMIT.saturating_add(quick.deleted.len());
+        let mut res = match open_local_database(main_db) {
+            None => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_UNAVAILABLE),
+            Some(database) => match read(
+                &lock(&database),
+                EXACT_SQL,
+                rusqlite::params![code, super::sql_limit(fetch_limit)],
+                fetch_limit,
+            ) {
+                Ok(candidates) => LocalQueryResult {
+                    candidates,
+                    diagnostic: None,
+                },
+                Err(_) => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_QUERY_FAILED),
             },
-            Err(_) => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_QUERY_FAILED),
-        },
+        };
+        res.candidates.retain(|item| {
+            !quick.is_deleted(&item.pinyin, &item.word)
+                && !quick.has_upsert(&item.pinyin, &item.word)
+        });
+        for row in &quick.upserts {
+            if row.key == code {
+                res.candidates.push(WordItem::new(
+                    row.key.clone(),
+                    row.value.clone(),
+                    row.weight,
+                    CandidateSource::QuickPhrase,
+                    "",
+                ));
+            }
+        }
+        res.candidates.sort_by(|left, right| {
+            right
+                .weight
+                .cmp(&left.weight)
+                .then_with(|| left.word.cmp(&right.word))
+        });
+        res.candidates.truncate(RESULT_LIMIT);
+        if !res.candidates.is_empty() {
+            res.diagnostic = None;
+        }
+        res
+    } else {
+        match open_local_database(main_db) {
+            None => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_UNAVAILABLE),
+            Some(database) => match read(
+                &lock(&database),
+                EXACT_SQL,
+                rusqlite::params![code, super::sql_limit(RESULT_LIMIT)],
+                RESULT_LIMIT,
+            ) {
+                Ok(candidates) => LocalQueryResult {
+                    candidates,
+                    diagnostic: None,
+                },
+                Err(_) => LocalQueryResult::failure(diagnostics::QUICK_PHRASE_QUERY_FAILED),
+            },
+        }
     };
     // 宿主短语表按编码排好序，编码相同的行连在一起；只把这一段交给前缀合并，结果就是精确匹配。
     let start = table.partition_point(|entry| entry.key.as_str() < code);
     let end = start + table[start..].partition_point(|entry| entry.key == code);
-    merge_quick_phrases(code, database, &table[start..end])
+    database = merge_quick_phrases(code, database, &table[start..end]);
+    database
 }
 
 fn read<P: rusqlite::Params>(

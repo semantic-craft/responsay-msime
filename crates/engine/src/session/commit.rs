@@ -561,8 +561,11 @@ impl InputSession {
 
     pub(super) fn canonical_phrase_engine(&mut self) -> &mut QuanpinEngine {
         let paths = &self.paths;
-        self.canonical_phrase_engine
-            .get_or_insert_with(|| QuanpinEngine::new(paths))
+        let read_only = self.read_only_dictionaries;
+        let overlay = &self.overlay;
+        self.canonical_phrase_engine.get_or_insert_with(|| {
+            QuanpinEngine::new_with_options(paths, read_only, overlay.clone())
+        })
     }
 
     /// `record_personal_context`, with its diagnostic kept only when nothing earlier failed.

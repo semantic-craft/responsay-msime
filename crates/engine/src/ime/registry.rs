@@ -14,6 +14,7 @@ use crate::cantonese::{
     UserWords,
 };
 use crate::diagnostics;
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::error::{EngineError, Result};
 use crate::helpcode::SharedKeymap;
 use crate::japanese::matrix::BestPath;
@@ -89,6 +90,31 @@ impl ProviderRegistry {
         stroke_path: PathBuf,
         japanese_path: PathBuf,
     ) -> Self {
+        Self::new_with_options(
+            enabled,
+            profile,
+            paths,
+            cantonese_path,
+            zhuyin_path,
+            stroke_path,
+            japanese_path,
+            false,
+            SharedUserOverlay::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        enabled: SchemeSet,
+        profile: &'static ShuangpinProfile,
+        paths: &RuntimePaths,
+        cantonese_path: PathBuf,
+        zhuyin_path: PathBuf,
+        stroke_path: PathBuf,
+        japanese_path: PathBuf,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         let japanese_model = if japanese_path.as_os_str().is_empty() {
             paths.resource(assets::JAPANESE_MODEL)
         } else {
@@ -98,10 +124,11 @@ impl ProviderRegistry {
             enabled.contains(SchemeType::Quanpin) || enabled.contains(SchemeType::Wubi);
         Self {
             enabled,
-            quanpin: quanpin_needed.then(|| QuanpinEngine::new(paths)),
+            quanpin: quanpin_needed
+                .then(|| QuanpinEngine::new_with_options(paths, read_only, overlay.clone())),
             shuangpin: enabled
                 .contains(SchemeType::Shuangpin)
-                .then(|| ShuangpinEngine::new(profile, paths)),
+                .then(|| ShuangpinEngine::new_with_options(profile, paths, read_only, overlay)),
             wubi: enabled.contains(SchemeType::Wubi).then(|| {
                 WubiProvider::with_pinyin_dictionary(
                     &wubi_database(paths),
@@ -219,7 +246,7 @@ impl ProviderRegistry {
         self.reset_pinyin_caches();
     }
 
-    fn reset_pinyin_caches(&mut self) {
+    pub(super) fn reset_pinyin_caches(&mut self) {
         if let Some(quanpin) = &mut self.quanpin {
             quanpin.reset_cache();
         }

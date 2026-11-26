@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::dictionary::overlay::SharedUserOverlay;
 use crate::dictionary::DictRow;
 use crate::error::Result;
 use crate::helpcode::{
@@ -26,9 +27,18 @@ pub struct QuanpinEngine {
 mod initial_helpcode_tests;
 
 impl QuanpinEngine {
+    #[cfg(test)]
     pub fn new(paths: &RuntimePaths) -> Self {
+        Self::new_with_options(paths, false, SharedUserOverlay::default())
+    }
+
+    pub fn new_with_options(
+        paths: &RuntimePaths,
+        read_only: bool,
+        overlay: SharedUserOverlay,
+    ) -> Self {
         Self {
-            dictionary: QuanpinDictionary::new(paths),
+            dictionary: QuanpinDictionary::new_with_options(paths, read_only, overlay),
         }
     }
 
